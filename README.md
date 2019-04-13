@@ -37,21 +37,27 @@ I've been unable to acquire an actual Green Bean module so all of my observation
 
     e2 23 22 2d f1 03 f1 2e 0e 03 03 01 19 15 05 2a 00 0a f1 76 fc 0f 0a f1 39 01 03 f1 33 01 5d 9c 30 e3 e1
 
-All packets begin with `e2` and end with `e1`. The byte `e0` acts as an escape character and all instances of `e0`, `e1`, `e2`, and `e3` in the body of the packet are escaped with `e0` (so `aa e0 bb e1 cc` becomes `aa e0 e0 bb e0 e1 cc`)
+All packets begin with `e2` and end with `e1`. The byte `e0` acts as an escape character and all instances of `e0`, `e1`, `e2`, and `e3` in the body of the packet are escaped with `e0` (so `aa e0 bb e1 cc` becomes `aa e0 e0 bb e0 e1 cc`).
 
-Each packet appears to have an eight byte header:
+Each packet has a three byte header:
 
  - (1 byte) packet sender's ID (`0x23` for the knob board, `0x2d` for the controller board)
  - (1 byte) total packet length
  - (1 byte) packet destination's ID
- - (4 bytes) packet ID?
- - (1 byte) command ID
 
-My washer seems to have three useful commands:
+The payload consists of a list of individual commands (the [`gea-sdk`](https://github.com/GEMakers/gea-sdk/blob/master/src/erd.js) lists `f0`, `f1`, `f2`, `f4`, and `f5` but I've only seen the first two) with the following structure:
 
- - `0x01`: sent from the controller to the knob board indicating some sort of washer state.
- - `0x0e`: sent from the knob board to the controller every second and whenever a knob is turned or a button is pushed/released.
- - `0xf1`: sent in reply to any of the above messages, most likely an ACK.
+ - The first command is `f1 NN`, where `NN` is the number of subsequent commands.
+ - Each of the subsequent commands is of the form:
+    - (1 byte) the command id
+    - (1 byte) the address
+    - (1 byte) the size of the command body
+    - (? bytes) the command body
+
+Responses to read and write commands (`f0` and `f1`, respectively) consist of an identically formatted response with no command body. For example, writing `00 00 00` to address `12` and reading address `13` would look like:
+
+    >>> f1 12 03 00 00 00   f0 13               (request)
+    <<< f1 12               f0 13 03 01 01 01   (response)
 
 Each packet ends with:
 
