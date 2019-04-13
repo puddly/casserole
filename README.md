@@ -61,12 +61,16 @@ Responses to read and write commands (`f0` and `f1`, respectively) consist of an
 
 Each packet ends with:
 
- - (2 bytes) a hash. It appears to be non-cryptographic and possibly similar in structure to [Fletcher-16](https://en.wikipedia.org/wiki/Fletcher%27s_checksum#Fletcher-16).
+ - (2 bytes) a checksum of the entire packet up until the start of the checksum bytes. It is a 16-bit CRC with the following parameters:
+
+       width=16  poly=0x1021  init=0xe300  refin=false  refout=false  xorout=0x0000  check=0x5b10  residue=0x0000  name=(none)
+
  - (2 bytes) `e3 e1`. Occasionally I see only `e3` but I suspect that may be a transmission error.
+
+
 
 ## TODO
 
- - Identify the hash. Without this, 65,536 possible checksums need to be tried to find the correct one.
  - Figure out how to safely begin injecting commands without interrupting other communications.
  - Build a tool to reliably dump traffic from the bus.
  - Create a new [GEA adapter](https://github.com/GEMakers/gea-adapter-usb) so that the open source GEA SDK can be used.
