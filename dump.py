@@ -5,8 +5,6 @@ with serial.Serial(sys.argv[1], baudrate=115200) as ser:
     line_count = 0
 
     while True:
-        print(ser.read(1).decode('latin-1'), flush=True, end='')
-        continue
         print(f'{ord(ser.read(1)):02x} ', end='', flush=True)
         line_count += 1
 
