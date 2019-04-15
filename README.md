@@ -7,7 +7,7 @@ The RJ45 (Ethernet) port on some GE appliances exposes a bus that allows for com
 The COMM bus uses 5V logic and is an *inverted* logic UART at 19,200 baud.
 
 ## Communication
-You can communicate with the appliance and all other devices on the bus with Arduino's `SoftwareSerial` and an adapter board that can tolerate 5V on its inputs (NodeMCU, some Arduino Pro Minis, etc.):
+You can communicate with the appliance and all other devices on the bus with Arduino's `SoftwareSerial` and an adapter board that can tolerate 5V on its inputs, like a 5V Arduino Pro Micro (or Pro Mini with a serial adapter board). Read-only monitoring can be done with the NodeMCU:
 
 ```C++
 #include <SoftwareSerial.h>
@@ -41,7 +41,7 @@ All packets begin with `e2` and end with `e1`. The byte `e0` acts as an escape c
 Each packet has a three byte header:
 
  - (1 byte) packet sender's ID (`0x23` for my washer's knob board, `0x2d` for the controller board)
- - (1 byte) total packet length
+ - (1 byte) total packet length (before the `e[0-3]` bytes have been escaped)
  - (1 byte) packet destination's ID
 
 The payload consists of a list of individual commands (the [`gea-sdk`](https://github.com/GEMakers/gea-sdk/blob/master/src/erd.js) lists `f0`, `f1`, `f2`, `f4`, and `f5` but I've only seen the first two) with the following structure:
@@ -64,7 +64,9 @@ Each packet ends with:
 
        width=16  poly=0x1021  init=0xe300  refin=false  refout=false  xorout=0x0000  check=0x5b10  residue=0x0000  name=(none)
 
- - (2 bytes) `e3 e1`. Occasionally I see only `e3` but I suspect that may be a transmission error.
+    As before, this is computed on the packet payload before the `e[0-3]` bytes have been escaped.
+
+ - (2 bytes) `e3 e1`.
 
 
 ## TODO
