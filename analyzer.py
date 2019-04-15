@@ -44,30 +44,9 @@ with serial.Serial(sys.argv[1], baudrate=115200) as ser:
             if size > 256:
                 raise BadPacketError(f'Packet too large: {size} > 256')
 
-            # We encapsulate the real packet in our own frame
-            # This probably isn't necessary anymore
             inner_packet = ser.read(size)
 
-            '''
-            # Replace the escapes
-            for byte in [b'\xE3', b'\xE2', b'\xE1', b'\xE0']:
-                inner_packet = inner_packet.replace(b'\xE0' + byte, byte)
-            '''
-
             buffer = BytesIO(inner_packet)
-
-            # Structure
-            #   e2 [1:source_id] [1:total_length] [1:dest_id] [4:transaction_id] [1:command] [???:escaped_payload] e3 [usually e1]
-            #   escaped_payload has all e0, e1, e2, and e3 bytes escaped with e0
-
-            '''
-            # All packets start with E2
-            packet_start = buffer.read(1)
-
-            if packet_start != b'\xE2':
-                print(f'Unknown packet start: {pretty_bytes(inner_packet)}')
-                continue
-            '''
 
             _ = buffer.read(1)  # The E2 byte
             source_addr = int.from_bytes(buffer.read(1), 'little')
