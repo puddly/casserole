@@ -39,15 +39,23 @@ void loop() {
 
 	PacketReaderResult read_result = maybe_read_bus_byte(reader_state, ge_serial);
 
-	if (read_result == PacketReaderResult::INVALID) {
+	if (read_result.result == PacketReaderResult::INVALID) {
 		last_byte_time = now;
 
+		int message_length = strlen(read_result.message);
+
+		// Send out an error
+		Serial.write((uint8_t)((message_length & 0xFF00) >> 8));
+		Serial.write((uint8_t)((message_length & 0x00FF) >> 0));
+		Serial.write(0x03);  // 0x01 is an error
+		Serial.write(read_result.message, message_length);
+
 		reader_state.reset();
-	} else if (read_result == PacketReaderResult::WAITING) {
+	} else if (read_result.result == PacketReaderResult::WAITING) {
 		// Do nothing
-	} else if (read_result == PacketReaderResult::READING) {
+	} else if (read_result.result == PacketReaderResult::READING) {
 		last_byte_time = now;
-	} else if (read_result == PacketReaderResult::VALID) {
+	} else if (read_result.result == PacketReaderResult::VALID) {
 		// We have a valid packet!
 		last_byte_time = now;
 
@@ -87,6 +95,7 @@ void loop() {
 			Serial.write((uint8_t)((0x0000 & 0xFF00) >> 8));
 			Serial.write((uint8_t)((0x0000 & 0x00FF) >> 0));
 			Serial.write(0x02);  // 0x02 is a sent notification
+			// No payload
 
 			// Reset the state so we can continue reading from serial the next iteration
 			write_result = PacketWriterResult::INVALID;

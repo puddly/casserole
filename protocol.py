@@ -98,13 +98,13 @@ class GEBusMessage:
         result += b'\xF1'
         result += len(self.commands).to_bytes(1, 'big')
 
-        for command_id, endpoint_id, response in self.commands:
+        for command_id, endpoint_id, data in self.commands:
             result += command_id.value.to_bytes(1, 'big')
             result += endpoint_id.to_bytes(1, 'big')
 
-            if response is not None:
-                result += len(response).to_bytes(1, 'big')
-                result += response
+            if data is not None:
+                result += len(data).to_bytes(1, 'big')
+                result += data
 
         return result
 
@@ -112,12 +112,12 @@ class GEBusMessage:
     def from_file(cls, f):
         assert read_exactly(f, 1) == b'\xE2'
 
-        source = int.from_bytes(read_exactly(f, 1), 'big')
+        destination = int.from_bytes(read_exactly(f, 1), 'big')
 
         size = int.from_bytes(read_exactly(f, 1), 'big')
         assert size >= 7
 
-        destination = int.from_bytes(read_exactly(f, 1), 'big')
+        source = int.from_bytes(read_exactly(f, 1), 'big')
         payload = read_exactly(f, size - 7)
 
         checksum = int.from_bytes(read_exactly(f, 2), 'big')
@@ -170,9 +170,9 @@ class GEBusMessage:
     def _dump_until_checksum(self):
         result = b''
         result += b'\xE2'
-        result += self.source.to_bytes(1, 'big')
-        result += (1 + 1 + 1 + 1 + len(self.pack_commands()) + 2 + 1).to_bytes(1, 'big')
         result += self.destination.to_bytes(1, 'big')
+        result += (1 + 1 + 1 + 1 + len(self.pack_commands()) + 2 + 1).to_bytes(1, 'big')
+        result += self.source.to_bytes(1, 'big')
         result += self.pack_commands()
 
         return result
@@ -182,10 +182,10 @@ class GEBusMessage:
         result += self.crc16(result).to_bytes(2, 'big')
 
         if escape:
-            result = result[0] + escape_bytes(result[1:], b'\xE0', b'\xE0\xE1\xE2\xE3')
+            result = result[:1] + escape_bytes(result[1:], b'\xE0', b'\xE0\xE1\xE2\xE3')
 
-        result += b'\xE1'
         result += b'\xE3'
+        result += b'\xE1'
 
         return result
 
@@ -203,6 +203,8 @@ class GEBusMessage:
 class CasseroleMessage:
     SERVER_RX_BUS_MESSAGE_ID = 0x01
     SERVER_TX_SERIAL_ID = 0x02
+    SERVER_RX_BUS_ERROR_ID = 0x03
+
     CLIENT_SEND_BUS_MESSAGE_ID = 0x11
 
     def __init__(self, type, payload):
@@ -227,7 +229,7 @@ class CasseroleMessage:
         type = int.from_bytes(read_exactly(f, 1), 'big')
         payload = read_exactly(f, size)
 
-        assert type in (0x01, 0x02, 0x11)
+        assert type in (0x01, 0x02, 0x03, 0x11)
 
         return cls(type, payload)
 
@@ -264,7 +266,20 @@ class CasseroleProtocol(asyncio.Protocol):
             await self.received_messages[CasseroleMessage.SERVER_TX_SERIAL_ID].get()
 
     async def receive(self):
-        return await self.received_messages[CasseroleMessage.SERVER_RX_BUS_MESSAGE_ID].get()
+        # We receive either a message or an error
+        rx_task = asyncio.create_task(self.received_messages[CasseroleMessage.SERVER_RX_BUS_MESSAGE_ID].get())
+        err_task = asyncio.create_task(self.received_messages[CasseroleMessage.SERVER_RX_BUS_ERROR_ID].get())
+
+        done, pending = await asyncio.wait([rx_task, err_task], return_when=asyncio.FIRST_COMPLETED)
+
+        assert len(done) == 1 and len(pending) == 1
+
+        # Make sure to cancel the task so the queue isn't consumed after we exit
+        for task in pending:
+            task.cancel()
+
+        return await list(done)[0]
+
 
     def connection_made(self, transport):
         self.transport = transport
@@ -299,68 +314,86 @@ async def main(adapter):
 
     while True:
         message = await protocol.receive()
-        ge_message = GEBusMessage.from_bytes(message.payload)
 
-        pair = (ge_message.source, ge_message.destination)
+        if message.type == CasseroleMessage.SERVER_RX_BUS_ERROR_ID:
+            print(f'Received an error: {message.payload}')
+        elif message.type == CasseroleMessage.SERVER_RX_BUS_MESSAGE_ID:
+            ge_message = GEBusMessage.from_bytes(message.payload)
 
-        if pair != last_pair:
-            last_pair = pair
-            #print()
+            pair = (ge_message.source, ge_message.destination)
 
-        for command, endpoint, data in ge_message.commands:
-            # Hide ACKs
-            if data is None:
-                continue
-
-            if ge_message.source == 0x23 and endpoint == 0x2E:
-                # Cycle knob state
-
-                turn_count = data[1]
-                history = data[3:-1]
-
-                named_history = [{
-                    0x01: 'Start (pressed)',
-                    0x02: 'Start (released)',
-
-                    0x03: 'Deep Rinse (pressed)',
-                    0x04: 'Deep Rinse (released)',
-
-                    0x05: 'Cycles (Off)',
-                    0x06: 'Cycles (Drain & Spin)',
-                    0x07: 'Cycles (Speed Wash)',
-                    0x08: 'Cycles (Delicates)',
-                    0x09: 'Cycles (Casuals)',
-                    0x0a: 'Cycles (Bulky Items)',
-
-                    0x0b: 'Cycles (Whites, Heavy)',
-                    0x0c: 'Cycles (Whites, Medium)',
-                    0x0d: 'Cycles (Whites, Light)',
-
-                    0x0e: 'Cycles (Colors, Heavy)',
-                    0x0f: 'Cycles (Colors, Medium)',
-                    0x10: 'Cycles (Colors, Light)',
-
-                    0x11: 'Temperature (Tap Cold)',
-                    0x12: 'Temperature (Hot)',
-                    0x13: 'Temperature (Warm)',
-                    0x14: 'Temperature (Colors)',
-                    0x15: 'Temperature (Cool)',
-                    0x16: 'Temperature (Cold)',
-
-                    0x17: 'Options (Off)',
-                    0x18: 'Options (2nd Rinse)',
-                    0x19: 'Options (Pre-Soak + 2nd Rinse)',
-                    0x1a: 'Options (unpopulated)',
-                    0x1b: 'Options (Pre-Soak 15 min)',
-                }[h] for h in history]
-
+            if pair != last_pair:
+                last_pair = pair
                 print()
-                print(f'0x{ge_message.source:02X} --> 0x{ge_message.destination:02X}  {command.name:<17}[0x{endpoint:02X}]  {pretty_bytes(data)}')
 
-                for h in named_history:
-                    print(f'    {h}')
+            print(f'               {pretty_bytes(message.payload)}')
 
-            assert ge_message.source == 0x23 and ge_message.destination == 0x2D or ge_message.source == 0x2D and ge_message.destination == 0x23
+            for command, endpoint, data in ge_message.commands:
+                '''
+                if ge_message.source == 0x23 and endpoint == 0x2E:
+                    # Cycle knob state
+
+                    turn_count = data[1]
+                    history = data[3:-1]
+
+                    named_history = [{
+                        0x01: 'Start (pressed)',
+                        0x02: 'Start (released)',
+
+                        0x03: 'Deep Rinse (pressed)',
+                        0x04: 'Deep Rinse (released)',
+
+                        0x05: 'Cycles (Off)',
+                        0x06: 'Cycles (Drain & Spin)',
+                        0x07: 'Cycles (Speed Wash)',
+                        0x08: 'Cycles (Delicates)',
+                        0x09: 'Cycles (Casuals)',
+                        0x0a: 'Cycles (Bulky Items)',
+
+                        0x0b: 'Cycles (Whites, Heavy)',
+                        0x0c: 'Cycles (Whites, Medium)',
+                        0x0d: 'Cycles (Whites, Light)',
+
+                        0x0e: 'Cycles (Colors, Heavy)',
+                        0x0f: 'Cycles (Colors, Medium)',
+                        0x10: 'Cycles (Colors, Light)',
+
+                        0x11: 'Temperature (Tap Cold)',
+                        0x12: 'Temperature (Hot)',
+                        0x13: 'Temperature (Warm)',
+                        0x14: 'Temperature (Colors)',
+                        0x15: 'Temperature (Cool)',
+                        0x16: 'Temperature (Cold)',
+
+                        0x17: 'Options (Off)',
+                        0x18: 'Options (2nd Rinse)',
+                        0x19: 'Options (Pre-Soak + 2nd Rinse)',
+                        0x1a: 'Options (unpopulated)',
+                        0x1b: 'Options (Pre-Soak 15 min)',
+                    }[h] for h in history]
+
+                    print()
+                    print(f'0x{ge_message.source:02X} --> 0x{ge_message.destination:02X}  {command.name:<17}[0x{endpoint:02X}]  {pretty_bytes(data)}')
+
+                    for h in named_history:
+                        print(f'    {h}')
+                '''
+
+                command_name = None
+
+                # Naming is inverted for READs, as expected
+                if command == GEBusMessage.Commands.READ:
+                    command_name = 'READ_RESP' if data is not None else 'READ'
+                elif data is None:
+                    command_name = command.name + '_RESP'
+                else:
+                    command_name = command.name
+
+                print(f'0x{ge_message.source:02X} --> 0x{ge_message.destination:02X}  {command_name:<17}[0x{endpoint:02X}]  {pretty_bytes(data) if data else ""}')
+
+                assert ge_message.source == 0x23 and ge_message.destination == 0x2D or ge_message.source == 0x2D and ge_message.destination == 0x23
+
+    #await protocol.send(GEBusMessage(source=0x1B, destination=0x01, commands=[]))
 
 
 
