@@ -1,7 +1,5 @@
 #include <assert.h>
-
 #include <Arduino.h>
-#include <SoftwareSerial.h>
 
 enum class PacketWriterResult {INVALID, WAITING, READING, VALID};
 

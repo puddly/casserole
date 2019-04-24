@@ -25,6 +25,9 @@ void write_casserole_message(Stream &stream, uint8_t type, uint16_t size, uint8_
 	stream.write((uint8_t)((size & 0x00FF) >> 0));
 	stream.write(type);
 	stream.write(payload, size);
+
+	// Timing for these messages isn't that important
+	//stream.flush();
 }
 
 void uint32_to_bytes(uint8_t* buffer, uint32_t &n) {
@@ -43,11 +46,8 @@ void setup() {
 		// Hardware serial isn't ready yet
 	}
 
-	pinMode(COMM_PIN, INPUT);
-	digitalWrite(COMM_PIN, LOW);  // Disable the internal pullup
-
-	// Having RX == TX == COMM_PIN doesn't enable both. It defaults to RX only as an implementation detail.
-	//ge_serial.setRX(COMM_PIN);
+	// Having RX == TX == COMM_PIN doesn't actually work. It defaults to RX only as an implementation detail.
+	ge_serial.setRX(COMM_PIN);
 	ge_serial.begin(BUS_BAUD);
 
 	delay(500);
@@ -102,14 +102,13 @@ void loop() {
 		if (bus_delta < 500) {
 			// Don't change the state, just wait
 		} else {
-			//ge_serial.setTX(COMM_PIN);
-
-			// Send the packet
-
-			//ge_serial.setRX(COMM_PIN);
+			// Briefly switch the software serial to TX mode and write the packet
+			ge_serial.setTX(COMM_PIN);
+			ge_serial.write(writer_state.body, writer_state.size);
+			ge_serial.flush();  // SoftwareSerial has no TX buffering but this won't hurt in case we swap it out later
+			ge_serial.setRX(COMM_PIN);
 
 			write_casserole_message(Serial, CASSEROLE_SERVER_TX_SERIAL_ID, 0x00, nullptr);
-			Serial.flush();
 
 			writer_state.reset();
 			write_result = PacketWriterResult::INVALID;

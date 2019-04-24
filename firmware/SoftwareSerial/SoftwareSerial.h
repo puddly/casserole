@@ -77,8 +77,13 @@ private:
   // private methods
   inline void recv() __attribute__((__always_inline__));
   uint8_t rx_pin_read();
+
+public:
+  // These two methods are useful. I could duplicate the code but it's easier this way.
   void setTX(uint8_t transmitPin);
   void setRX(uint8_t receivePin);
+
+private:
   inline void setRxIntMsk(bool enable) __attribute__((__always_inline__));
 
   // Return num - sub, or 1 if the result would be < 1
