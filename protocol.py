@@ -204,8 +204,11 @@ class CasseroleMessage:
     SERVER_RX_BUS_MESSAGE_ID = 0x01
     SERVER_TX_SERIAL_ID = 0x02
     SERVER_RX_BUS_ERROR_ID = 0x03
+    SERVER_TX_SERIAL_ACK = 0x0F
 
     CLIENT_SEND_BUS_MESSAGE_ID = 0x11
+
+    SERVER_DEBUG = 0xDE
 
     def __init__(self, type, payload):
         self.type = type
@@ -229,7 +232,7 @@ class CasseroleMessage:
         type = int.from_bytes(read_exactly(f, 1), 'big')
         payload = read_exactly(f, size)
 
-        assert type in (0x01, 0x02, 0x03, 0x11)
+        assert type in (0x01, 0x02, 0x03, 0x0F, 0x11, 0xDE)
 
         return cls(type, payload)
 
@@ -252,6 +255,7 @@ class CasseroleProtocol(asyncio.Protocol):
     def __init__(self):
         super().__init__()
 
+        self.transport = None
         self.send_lock = asyncio.Lock()
         self.received_messages = defaultdict(asyncio.Queue)
 
@@ -261,18 +265,19 @@ class CasseroleProtocol(asyncio.Protocol):
         # We can send only one message at a time for now
         async with self.send_lock:
             outer_message = CasseroleMessage(CasseroleMessage.CLIENT_SEND_BUS_MESSAGE_ID, message.to_bytes(escape=True))
-            self.transport.write(outer_message)
+            self.transport.write(outer_message.to_bytes())
 
             await self.received_messages[CasseroleMessage.SERVER_TX_SERIAL_ID].get()
 
     async def receive(self):
         # We receive either a message or an error
         rx_task = asyncio.create_task(self.received_messages[CasseroleMessage.SERVER_RX_BUS_MESSAGE_ID].get())
+        debug_task = asyncio.create_task(self.received_messages[CasseroleMessage.SERVER_DEBUG].get())
         err_task = asyncio.create_task(self.received_messages[CasseroleMessage.SERVER_RX_BUS_ERROR_ID].get())
 
-        done, pending = await asyncio.wait([rx_task, err_task], return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait([rx_task, debug_task, err_task], return_when=asyncio.FIRST_COMPLETED)
 
-        assert len(done) == 1 and len(pending) == 1
+        assert len(done) == 1
 
         # Make sure to cancel the task so the queue isn't consumed after we exit
         for task in pending:
@@ -309,14 +314,32 @@ async def main(adapter):
     loop = asyncio.get_event_loop()
     transport, protocol = await serial_asyncio.create_serial_connection(loop, CasseroleProtocol, adapter, baudrate=115200)
 
+    while not protocol.transport:
+        print('Waiting to connect...')
+        await asyncio.sleep(1)
+
     # Visually distinguish groups of commands
     last_pair = None
+
+    async def later():
+        while True:
+            print('############################## Sending #####################')
+            await asyncio.sleep(1)
+            await protocol.send(GEBusMessage(source=0x1B, destination=0x00, commands=[
+                (GEBusMessage.Commands.READ, 0x01, None)
+            ]))
+            print('############################## Sent #####################')
+
+
+    asyncio.create_task(later())
 
     while True:
         message = await protocol.receive()
 
         if message.type == CasseroleMessage.SERVER_RX_BUS_ERROR_ID:
             print(f'Received an error: {message.payload}')
+        elif message.type == CasseroleMessage.SERVER_DEBUG:
+            print(f'!!!!!!!!!!!!!!!!!!!!!!!!!! SERVER SAYS {message.payload} !!!!!!!!!!!!!!!!!!!!!!!!!!!')
         elif message.type == CasseroleMessage.SERVER_RX_BUS_MESSAGE_ID:
             ge_message = GEBusMessage.from_bytes(message.payload)
 
@@ -392,10 +415,6 @@ async def main(adapter):
                 print(f'0x{ge_message.source:02X} --> 0x{ge_message.destination:02X}  {command_name:<17}[0x{endpoint:02X}]  {pretty_bytes(data) if data else ""}')
 
                 assert ge_message.source == 0x23 and ge_message.destination == 0x2D or ge_message.source == 0x2D and ge_message.destination == 0x23
-
-    #await protocol.send(GEBusMessage(source=0x1B, destination=0x01, commands=[]))
-
-
 
 if __name__ == '__main__':
     asyncio.run(main(sys.argv[1]))

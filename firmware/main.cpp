@@ -1,7 +1,7 @@
 #include <assert.h>
 
 #include <Arduino.h>
-#include <SoftwareSerial.h>
+#include "SoftwareSerial/SoftwareSerial.h"
 
 #include "reader.h"
 #include "writer.h"
@@ -10,7 +10,29 @@
 constexpr uint32_t BUS_BAUD = 19200;
 constexpr uint8_t COMM_PIN = 3;
 
+constexpr uint8_t CASSEROLE_SERVER_RX_BUS_MESSAGE_ID = 0x01;
+constexpr uint8_t CASSEROLE_SERVER_TX_SERIAL_ID = 0x02;
+constexpr uint8_t CASSEROLE_SERVER_RX_BUS_ERROR_ID = 0x03;
+constexpr uint8_t CASSEROLE_SERVER_TX_SERIAL_ACK = 0x0F;
+constexpr uint8_t CASSEROLE_CLIENT_SEND_BUS_MESSAGE_ID = 0x11;
+constexpr uint8_t CASSEROLE_SERVER_DEBUG = 0xDE;
+
 SoftwareSerial ge_serial(COMM_PIN, COMM_PIN, true);  // inverted logic
+
+
+void write_casserole_message(Stream &stream, uint8_t type, uint16_t size, uint8_t *payload) {
+	stream.write((uint8_t)((size & 0xFF00) >> 8));
+	stream.write((uint8_t)((size & 0x00FF) >> 0));
+	stream.write(type);
+	stream.write(payload, size);
+}
+
+void uint32_to_bytes(uint8_t* buffer, uint32_t &n) {
+	buffer[0] = (uint8_t)((n & 0xFF000000) >> 24);
+	buffer[1] = (uint8_t)((n & 0x00FF0000) >> 16);
+	buffer[2] = (uint8_t)((n & 0x0000FF00) >>  8);
+	buffer[3] = (uint8_t)((n & 0x000000FF) >>  0);
+}
 
 
 void setup() {
@@ -21,10 +43,13 @@ void setup() {
 		// Hardware serial isn't ready yet
 	}
 
-	digitalWrite(COMM_PIN, LOW);  // It helps?
+	pinMode(COMM_PIN, INPUT);
+	digitalWrite(COMM_PIN, LOW);  // Disable the internal pullup
+
+	// Having RX == TX == COMM_PIN doesn't enable both. It defaults to RX only as an implementation detail.
+	//ge_serial.setRX(COMM_PIN);
 	ge_serial.begin(BUS_BAUD);
 
-	// Helps prevent garbage at beginning somehow
 	delay(500);
 }
 
@@ -42,13 +67,8 @@ void loop() {
 	if (read_result.result == PacketReaderResult::INVALID) {
 		last_byte_time = now;
 
-		int message_length = strlen(read_result.message);
-
 		// Send out an error
-		Serial.write((uint8_t)((message_length & 0xFF00) >> 8));
-		Serial.write((uint8_t)((message_length & 0x00FF) >> 0));
-		Serial.write(0x03);  // 0x01 is an error
-		Serial.write(read_result.message, message_length);
+		write_casserole_message(Serial, CASSEROLE_SERVER_RX_BUS_ERROR_ID, strlen(read_result.message), (uint8_t*)read_result.message);
 
 		reader_state.reset();
 	} else if (read_result.result == PacketReaderResult::WAITING) {
@@ -60,10 +80,7 @@ void loop() {
 		last_byte_time = now;
 
 		// Send it out
-		Serial.write((uint8_t)((reader_state.size & 0xFF00) >> 8));
-		Serial.write((uint8_t)((reader_state.size & 0x00FF) >> 0));
-		Serial.write(0x01);  // 0x01 is data from the bus
-		Serial.write(reader_state.body, reader_state.size);
+		write_casserole_message(Serial, CASSEROLE_SERVER_RX_BUS_MESSAGE_ID, reader_state.size, reader_state.body);
 	} else {
 		assert(0);  // This cannot happen
 	}
@@ -82,22 +99,19 @@ void loop() {
 	static PacketWriterResult write_result = PacketWriterResult::INVALID;
 
 	if (write_result == PacketWriterResult::VALID) {
-		if (bus_delta <= PacketReaderState::MIN_INTER_PACKET_DELAY) {
-			// Do nothing until we have time to send it
+		if (bus_delta < 500) {
+			// Don't change the state, just wait
 		} else {
-			// Write the buffered packet to the bus (we skip the two size bytes and the type)
-			ge_serial.write(writer_state.body + 3, writer_state.get_size_from_header());
+			//ge_serial.setTX(COMM_PIN);
 
-			// Actually send out the data
-			ge_serial.flush();
+			// Send the packet
 
-			// Tell the client we sent the data
-			Serial.write((uint8_t)((0x0000 & 0xFF00) >> 8));
-			Serial.write((uint8_t)((0x0000 & 0x00FF) >> 0));
-			Serial.write(0x02);  // 0x02 is a sent notification
-			// No payload
+			//ge_serial.setRX(COMM_PIN);
 
-			// Reset the state so we can continue reading from serial the next iteration
+			write_casserole_message(Serial, CASSEROLE_SERVER_TX_SERIAL_ID, 0x00, nullptr);
+			Serial.flush();
+
+			writer_state.reset();
 			write_result = PacketWriterResult::INVALID;
 		}
 	} else {
@@ -111,8 +125,9 @@ void loop() {
 		} else if (write_result == PacketWriterResult::INVALID) {
 			writer_state.reset();
 		} else if (write_result == PacketWriterResult::VALID) {
-			// This should be impossible but we can still handle it
 			// Do nothing until the next iteration
+		} else {
+			assert(0);
 		}
 	}
 }

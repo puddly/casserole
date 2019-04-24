@@ -7,7 +7,6 @@ enum class PacketWriterResult {INVALID, WAITING, READING, VALID};
 
 class PacketWriterState {
 	public:
-		static constexpr uint32_t MIN_INTER_PACKET_DELAY = 100000;
 		static constexpr uint16_t MAX_PACKET_SIZE = 256;
 
 	public:
@@ -43,7 +42,7 @@ class PacketWriterState {
 				return false;
 			}
 
-			return size > expected_size;
+			return (int16_t)size > expected_size;
 		}
 
 		void add_byte(uint8_t byte) {
@@ -65,17 +64,18 @@ PacketWriterResult maybe_read_serial_byte(PacketWriterState &state, Stream &stre
 	}
 
 	uint8_t byte = stream.read();
+	state.add_byte(byte);
 
 	// If the packet is too big, discard it
 	if (state.is_too_big()) {
 		return PacketWriterResult::INVALID;
 	}
 
-	state.add_byte(byte);
+	int16_t expected_size = state.get_size_from_header();
 
-	if (state.size != state.get_size_from_header()) {
-		return PacketWriterResult::READING;
+	if (expected_size != -1 && (int16_t)state.size == expected_size) {
+		return PacketWriterResult::VALID;
 	}
 
-	return PacketWriterResult::VALID;
+	return PacketWriterResult::READING;
 }

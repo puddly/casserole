@@ -48,7 +48,7 @@ class PacketReaderState {
 				return false;
 			}
 
-			return size > expected_size;
+			return (int16_t)size > expected_size;
 		}
 
 		void add_byte(uint8_t byte) {
@@ -124,7 +124,7 @@ PacketReaderResult maybe_read_bus_byte(PacketReaderState &state, Stream &stream)
 		// End of packet
 
 		// Ensure we've read exactly the right number of bytes
-		if (state.get_size_from_header() != state.size) {
+		if (state.get_size_from_header() != (int16_t)state.size) {
 			return PacketReaderResult{PacketReaderResult::State::INVALID, "Bad size"};
 		}
 
