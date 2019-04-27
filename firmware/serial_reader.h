@@ -1,18 +1,17 @@
-#include <assert.h>
 #include <Arduino.h>
 
-enum class PacketWriterResult {INVALID, WAITING, READING, VALID};
+enum class SerialReaderResult {INVALID, READING, VALID};
 
-class PacketWriterState {
+class SerialReaderState {
 	public:
-		static constexpr uint16_t MAX_PACKET_SIZE = 256;
-
-	public:
-		uint8_t body[MAX_PACKET_SIZE];
-		uint16_t size;
+		static constexpr uint16_t MAX_PACKET_SIZE = 128;
 
 	public:
-		PacketWriterState() {
+		uint8_t body[MAX_PACKET_SIZE + 10];
+		uint8_t size;
+
+	public:
+		SerialReaderState() {
 			reset();
 		}
 
@@ -56,24 +55,20 @@ class PacketWriterState {
 		}
 };
 
-PacketWriterResult maybe_read_serial_byte(PacketWriterState &state, Stream &stream) {
-	if (!stream.available()) {
-		return PacketWriterResult::WAITING;
-	}
-
+SerialReaderResult read_serial_byte(SerialReaderState &state, Stream &stream) {
 	uint8_t byte = stream.read();
 	state.add_byte(byte);
 
 	// If the packet is too big, discard it
 	if (state.is_too_big()) {
-		return PacketWriterResult::INVALID;
+		return SerialReaderResult::INVALID;
 	}
 
 	int16_t expected_size = state.get_size_from_header();
 
 	if (expected_size != -1 && (int16_t)state.size == expected_size) {
-		return PacketWriterResult::VALID;
+		return SerialReaderResult::VALID;
 	}
 
-	return PacketWriterResult::READING;
+	return SerialReaderResult::READING;
 }

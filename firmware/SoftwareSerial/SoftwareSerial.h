@@ -79,9 +79,10 @@ private:
   uint8_t rx_pin_read();
 
 public:
-  // These two methods are useful. I could duplicate the code but it's easier this way.
+  // These methods are useful. I could duplicate the code but it's easier this way.
   void setTX(uint8_t transmitPin);
   void setRX(uint8_t receivePin);
+  void fakeRecv(uint8_t *buffer, uint8_t size);
 
 private:
   inline void setRxIntMsk(bool enable) __attribute__((__always_inline__));
