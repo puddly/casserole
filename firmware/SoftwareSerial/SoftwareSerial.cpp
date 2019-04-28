@@ -134,8 +134,6 @@ void SoftwareSerial::fakeRecv(uint8_t *buffer, uint8_t size) {
 			break;
 		}
 	}
-
-	return i;
 }
 
 //

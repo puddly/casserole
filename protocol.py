@@ -51,6 +51,10 @@ def pretty_bytes(bytes_object):
     return ' '.join([hex(b)[2:].zfill(2) for b in bytes_object])
 
 
+class CasseroleError(ValueError):
+    pass
+
+
 class GEBusMessage:
     class Commands(enum.Enum):
         READ = 0xF0
@@ -226,6 +230,51 @@ class GEBusMessage:
 
 
 
+class TinyCOBS:
+    @staticmethod
+    def encode(data):
+        assert len(data) <= 0xFF - 2
+        data = bytes(data) + b'\x00'
+
+        index_of_last_zero = 0
+        result = bytearray([0x00] * (1 + len(data)))
+
+        for offset in range(len(data)):
+            byte = data[offset]
+
+            if byte == 0x00:
+                result[index_of_last_zero] = offset - index_of_last_zero + 1
+                index_of_last_zero = offset + 1
+            else:
+                result[offset + 1] = byte
+
+        return result
+
+    @staticmethod
+    def decode(data):
+        assert 2 <= len(data) <= 0xFF
+
+        output = bytearray([0x00] * (len(data) - 1))
+        next_zero_in = data[0]
+
+        for offset in range(len(data) - 1):
+            next_zero_in -= 1
+            byte = data[offset + 1]
+
+            if next_zero_in == 0:
+                output[offset] = 0x00
+                next_zero_in = byte
+
+                if offset + next_zero_in > len(data):
+                    raise ValueError('Invalid zero pointer')
+            else:
+                output[offset] = byte
+
+        return output[:-1]
+
+
+
+
 class CasseroleMessage:
     class Commands(enum.Enum):
         BUS_MESSAGE = 0x01
@@ -233,6 +282,7 @@ class CasseroleMessage:
 
         SEND_BUS_MESSAGE = 0x11
         SEND_BUS_MESSAGE_ACK = 0x12
+        SEND_BUS_MESSAGE_ERR = 0x13
         SEND_BUS_MESSAGE_TX = 0x02
 
         PING = 0xFF
@@ -245,13 +295,16 @@ class CasseroleMessage:
 
     @property
     def size(self):
-        return 2 + 1 + len(self.payload)
+        return 1 + 1 + len(self.payload) + 2
 
     def to_bytes(self):
         result = b''
-        result += self.size.to_bytes(2, 'big')
+        result += self.size.to_bytes(1, 'big')
         result += self.type.value.to_bytes(1, 'big')
         result += self.payload
+        result += GEBusMessage.crc16(result).to_bytes(2, 'big')
+
+        assert GEBusMessage.crc16(result) == 0x0000
 
         return result
 
@@ -314,12 +367,15 @@ class CasseroleProtocol(asyncio.Protocol):
         self.events = EventBus()
         self.received_messages = defaultdict(asyncio.Queue)
 
-        self.incomplete_message = b''
+        self._buffer = b''
+        self._wait_for_resync = False
 
         @self.events.on('packet:casserole')
         def casserole_handler(message):
             if message.type == CasseroleMessage.Commands.BUS_MESSAGE:
                 self.events.emit('packet:ge', GEBusMessage.from_bytes(message.payload))
+            elif message.type == CasseroleMessage.Commands.SEND_BUS_MESSAGE_ERR:
+                logger.error('Caught an error: %s', message.payload)
         
         @self.events.on('packet:ge')
         def ge_handler(message):
@@ -337,8 +393,9 @@ class CasseroleProtocol(asyncio.Protocol):
                 result_future.set_result(rx_message)
                 self.events.off('packet:casserole', on_packet)
 
-            self.transport.write(message.to_bytes())
+            # We handle framing transparently
             logger.debug('>>> %s', message)
+            self.transport.write(TinyCOBS.encode(message.to_bytes()))
 
             try:
                 return await result_future
@@ -346,12 +403,30 @@ class CasseroleProtocol(asyncio.Protocol):
                 self.events.off('packet:casserole', on_packet)
                 raise
 
-    async def broadcast_ge_message(self, message):
+    async def broadcast_ge_message(self, message, *, retry=5, timeout=2):
+        for i in range(retry):
+            try:
+                iterator = self._broadcast_ge_message(message)
+
+                while True:
+                    async with async_timeout.timeout(timeout):
+                        try:
+                            yield await iterator.__anext__()
+                        except StopAsyncIteration:
+                            return
+            except (CasseroleError, asyncio.TimeoutError):
+                logger.error('Failed to send message. Retrying...')
+
+        raise CasseroleError('Could not send the message')
+
+    async def _broadcast_ge_message(self, message):
         outer = CasseroleMessage(CasseroleMessage.Commands.SEND_BUS_MESSAGE, message.to_bytes(escape=True))
         results = asyncio.Queue()
 
         @self.events.on('packet:ge')
         def on_packet(rx_message):
+            print(f'Got a packet from 0x{rx_message.source:02X} to 0x{rx_message.destination:02X} with payload {pretty_bytes(rx_message.encode_data())}')
+
             if message.destination != 0xFF and rx_message.source != message.destination:
                 return
 
@@ -364,16 +439,16 @@ class CasseroleProtocol(asyncio.Protocol):
 
             results.put_nowait(rx_message)
 
-        await self.send_casserole_message(outer, accept=lambda m: m.type == CasseroleMessage.Commands.SEND_BUS_MESSAGE_TX)
-
         try:
+            await self.send_casserole_message(outer, accept=lambda m: m.type in [CasseroleMessage.Commands.SEND_BUS_MESSAGE_TX, CasseroleMessage.Commands.SEND_BUS_MESSAGE_ACK, CasseroleMessage.Commands.SEND_BUS_MESSAGE_ERR])
+
             while True:
                 yield await results.get()
         finally:
             self.events.off('packet:ge', on_packet)
 
-    async def send_ge_message(self, message):
-        async for response in self.broadcast_ge_message(message):
+    async def send_ge_message(self, message, *, retry=5, timeout=2):
+        async for response in self.broadcast_ge_message(message, retry=retry, timeout=timeout):
             return response
 
     async def ping(self):
@@ -383,25 +458,37 @@ class CasseroleProtocol(asyncio.Protocol):
         self.transport = transport
 
     def data_received(self, data):
-        self.incomplete_message += data
-
-        while True:
-            if len(self.incomplete_message) < 3:
+        if self._wait_for_resync:
+            if b'\x00' not in data:
                 return
 
-            size = int.from_bytes(self.incomplete_message[0:2], 'big')
-            packet_type = int.from_bytes(self.incomplete_message[2:3], 'big')
+            # COBS ensures null bytes exist only at frame boundaries
+            self._wait_for_resync = False
+            self._buffer = data[data.index(b'\x00') + 1:]
 
-            if len(self.incomplete_message) < 2 + 1 + size:
+        self._buffer += data
+
+        while b'\x00' in self._buffer:
+            frame, _, self._buffer = self._buffer.partition(b'\x00')
+            frame += b'\x00'
+
+            try:
+                packet = TinyCOBS.decode(frame)
+            except ValueError:
+                logger.error('Invalid frame! Resyncing...')
+                self._buffer = b''
+                self._wait_for_resync = True
                 return
 
-            message = self.incomplete_message[:2 + 1 + size]
-            self.incomplete_message = self.incomplete_message[2 + 1 + size:]
+            try:
+                parsed_message = CasseroleMessage.from_bytes(packet)
+            except ValueError:
+                logger.error('Caught an error while reading packet! Discarding...')
+                continue
 
-            if CasseroleMessage.from_bytes(message).type != 0x01:
-                logger.debug('<<< %s', CasseroleMessage.from_bytes(message))
+            logger.debug('<<< %s', parsed_message)
 
-            self.events.emit('packet:casserole', CasseroleMessage.from_bytes(message))
+            self.events.emit('packet:casserole', parsed_message)
 
     def connection_lost(self, exc):
         pass
@@ -409,28 +496,17 @@ class CasseroleProtocol(asyncio.Protocol):
 
 async def main(adapter):
     loop = asyncio.get_event_loop()
-    transport, protocol = await serial_asyncio.create_serial_connection(loop, CasseroleProtocol, adapter, baudrate=19200)
+    transport, protocol = await serial_asyncio.create_serial_connection(loop, CasseroleProtocol, adapter, baudrate=115200)
 
     while not protocol.transport:
         logger.info('Waiting to connect...')
         await asyncio.sleep(1)
 
-    async def ping():
-        while True:
-            try:
-                with async_timeout.timeout(2):
-                    logger.info('Waiting for a ping response...')
-                    await protocol.ping()
-                    break
-            except asyncio.TimeoutError:
-                print('Timed out!')
-
-    # XXX some bug corrupts the first received message
-    await ping()
+    await protocol.ping()
 
     logger.info('Sending a broadcast to identify devices...')
 
-    async for response in protocol.broadcast_ge_message(GEBusMessage(source=0x1B, destination=0xFF, data=b'\x01')):
+    async for response in protocol.broadcast_ge_message(GEBusMessage(source=0x1B, destination=0xFF, data=b'\x01'), retry=1000, timeout=0.5):
         endpoint, version = response.source, response.data
         break
 
@@ -438,8 +514,7 @@ async def main(adapter):
 
 
     for i in range(1000):
-        appliance = 0x23
-        cycle = await protocol.send_ge_message(GEBusMessage(source=0x1B, destination=appliance, data=b'\xf0\x01\x20\x0A'))
+        cycle = await protocol.send_ge_message(GEBusMessage(source=0x1B, destination=endpoint, data=b'\xf0\x01\x20\x0A'), retry=1000, timeout=0.5)
 
         logger.info('Current selected cycle is %s', cycle.data)
         await asyncio.sleep(1)
