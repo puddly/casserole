@@ -145,12 +145,7 @@ class GEBusMessage:
 
         assert read_exactly(f, 1) == b'\xE3'
 
-        try:
-            data = cls.parse_commands(payload)
-        except ValueError:
-            data = payload
-
-        message = cls(source, destination, data)
+        message = cls(source, destination, payload)
         assert message.checksum == checksum
 
         return message
@@ -160,6 +155,9 @@ class GEBusMessage:
         f = BytesIO(data)
         message = cls.from_file(f)
         remaining = f.read()
+
+        if remaining.startswith(b'\xe1'):
+            remaining = remaining[1:]
 
         if remaining:
             raise ValueError(f'Unused data remains at the end: {remaining}')
@@ -354,7 +352,8 @@ class EventBus:
                 callback(*args, **kwargs)
 
     def off(self, key, callback):
-        self.listeners[key].remove(callback)
+        if callback in self.listeners[key]:
+            self.listeners[key].remove(callback)
 
 
 class CasseroleProtocol(asyncio.Protocol):
@@ -379,25 +378,29 @@ class CasseroleProtocol(asyncio.Protocol):
         
         @self.events.on('packet:ge')
         def ge_handler(message):
-            pass
+            if message.source == 0x2D:
+                temp = GEBusMessage.from_bytes(message.to_bytes())
+                temp.data = GEBusMessage.parse_commands(message.data)
+
+                logger.debug('Read a bus message: %s', temp)
 
     async def send_casserole_message(self, message, accept=lambda m: True):
         async with self.send_lock:
             result_future = asyncio.get_event_loop().create_future()
 
-            @self.events.on('packet:casserole')
-            def on_packet(rx_message):
-                if not accept(rx_message):
-                    return
-
-                result_future.set_result(rx_message)
-                self.events.off('packet:casserole', on_packet)
-
-            # We handle framing transparently
-            logger.debug('>>> %s', message)
-            self.transport.write(TinyCOBS.encode(message.to_bytes()))
-
             try:
+                @self.events.on('packet:casserole')
+                def on_packet(rx_message):
+                    if not accept(rx_message):
+                        return
+
+                    result_future.set_result(rx_message)
+                    self.events.off('packet:casserole', on_packet)
+
+                # We handle framing transparently
+                logger.debug('>>> %s', message)
+                self.transport.write(TinyCOBS.encode(message.to_bytes()))
+
                 return await result_future
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 self.events.off('packet:casserole', on_packet)
@@ -434,8 +437,8 @@ class CasseroleProtocol(asyncio.Protocol):
                 return
 
             # XXX: Expose the command properly
-            if rx_message.data[0] != message.data[0]:
-                return
+            #if rx_message.data[0] != message.data[0]:
+            #    return
 
             results.put_nowait(rx_message)
 
@@ -499,25 +502,42 @@ async def main(adapter):
     transport, protocol = await serial_asyncio.create_serial_connection(loop, CasseroleProtocol, adapter, baudrate=115200)
 
     while not protocol.transport:
-        logger.info('Waiting to connect...')
+        logger.warning('Waiting to connect...')
         await asyncio.sleep(1)
 
     await protocol.ping()
 
-    logger.info('Sending a broadcast to identify devices...')
+    logger.warning('Sending a broadcast to identify devices...')
 
     async for response in protocol.broadcast_ge_message(GEBusMessage(source=0x1B, destination=0xFF, data=b'\x01'), retry=1000, timeout=0.5):
         endpoint, version = response.source, response.data
         break
 
-    logger.info('Found an appliance version %r at 0x%0.2X', version, endpoint)
+    logger.warning('Found an appliance version %r at 0x%0.2X', version, endpoint)
 
 
     for i in range(1000):
-        cycle = await protocol.send_ge_message(GEBusMessage(source=0x1B, destination=endpoint, data=b'\xf0\x01\x20\x0A'), retry=1000, timeout=0.5)
+        cycle = await protocol.send_ge_message(GEBusMessage(
+            source=0x1B,
+            destination=endpoint,
+            data=b'\xf0' + b'\x01' + (0x200A).to_bytes(2, 'big')
+        ), retry=1000, timeout=0.5)
 
-        logger.info('Current selected cycle is %s', cycle.data)
+        logger.warning('Current selected cycle is %s', cycle.data)
         await asyncio.sleep(1)
+
+        for i in range(0, 100):
+            logger.warning('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+            cycle = await protocol.send_ge_message(GEBusMessage(
+                source=0x1B,
+                destination=endpoint,
+                data=b'\xf1' + b'\x01' + (0x2000 + i).to_bytes(2, 'big') + b'\x01\x01'
+            ), retry=1000, timeout=0.5)
+
+            logger.warning('Current selected cycle is %s', cycle.data)
+            await asyncio.sleep(1)
+
+
 
 if __name__ == '__main__':
     asyncio.run(main(sys.argv[1]))

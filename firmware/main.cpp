@@ -212,19 +212,6 @@ void loop() {
 			} else {
 				SerialReaderResult serial_read_result = read_serial_byte(serial_reader_state, byte);
 
-				uint8_t n;
-
-				if (serial_read_result.result == SerialReaderResult::READING) {
-					n = 0x01;
-				} else if (serial_read_result.result == SerialReaderResult::INVALID) {
-					n = 0x02;
-				} else if (serial_read_result.result == SerialReaderResult::VALID) {
-					n = 0x03;
-				}
-
-				uint8_t buffer[] = {n, serial_reader_state.size, byte};
-				send_to_computer(CasseroleMessage::DEBUG, sizeof(buffer), buffer);
-
 				if (serial_read_result.result == SerialReaderResult::READING) {
 					// Do nothing
 				} else if (serial_read_result.result == SerialReaderResult::INVALID) {
@@ -237,7 +224,6 @@ void loop() {
 				} else if (serial_read_result.result == SerialReaderResult::VALID) {
 					// Handle this case above
 					waiting_to_send = true;
-					initial_send_time = now;
 					send_to_computer(CasseroleMessage::SEND_BUS_MESSAGE_ACK);
 				} else {
 					assert(false);
