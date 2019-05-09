@@ -1,4 +1,3 @@
-import re
 import sys
 import enum
 import inspect
@@ -13,16 +12,47 @@ from io import BytesIO
 from collections import defaultdict
 
 import coloredlogs
+from verboselogs import VerboseLogger
 
-logger = logging.getLogger(__name__)
-coloredlogs.install(level='DEBUG')
+logger = VerboseLogger(__name__)
+coloredlogs.install(level='SPAM')
 
 
-def escape_bytes(data, escape_char, bad_chars):
-    return re.sub(rb'([' + re.escape(bad_chars) + rb'])', re.escape(escape_char) + rb'\1', data)
+class EscapedStream:
+    def __init__(self, f):
+        self.f = f
 
-def unescape_bytes(data, escape_char, bad_chars):
-    return re.sub(re.escape(escape_char) + rb'([' + re.escape(bad_chars) + rb'])', rb'\1', data)
+    def read(self, n=-1):
+        results = bytearray()
+
+        while n != 0:
+            b = self.f.read(1)
+
+            if not b:
+                break
+
+            if b in b'\xe1\xe2\xe3':
+                raise ValueError('Unescaped control character')
+            elif b == b'\xe0':
+                b = self.f.read(1)
+
+                if not b:
+                    raise ValueError('Truncated escape sequence')
+
+                if b not in b'\xe1\xe2\xe3':
+                    raise ValueError('Invalid escape sequence')
+
+            results.append(b)
+            n -= 1
+
+        return results
+
+    def write(self, data):
+        for byte in data:
+            if byte in b'\xe0\xe1\xe2\xe3':
+                self.f.write(bytes([0xe0, byte]))
+            else:
+                self.f.write(byte)
 
 
 def read_exactly(f, size):
@@ -35,14 +65,6 @@ def read_exactly(f, size):
             raise ValueError(f'Could only read {len(result)} of {size} bytes!')
 
         result += chunk
-
-    return result
-
-
-def peek(f, n):
-    old = f.tell()
-    result = f.read(n)
-    f.seek(old)
 
     return result
 
@@ -72,64 +94,6 @@ class GEBusMessage:
         self.data = data
 
     @classmethod
-    def parse_commands(cls, data):
-        f = BytesIO(data)
-
-        command_type = int.from_bytes(f.read(1), 'big')
-
-        if command_type != 0xF1:
-            raise ValueError('Data is not a read/write command')
-
-        # Not sure why this is necessary
-        count = int.from_bytes(f.read(1), 'big')
-
-        commands = []
-
-        for i in range(count):
-            subcommand = cls.Commands(int.from_bytes(f.read(1), 'big'))
-            endpoint_id = int.from_bytes(f.read(1), 'big')
-
-            next_byte = peek(f, 1)
-
-            if not next_byte or next_byte in bytearray([0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5]):
-                commands.append((subcommand, endpoint_id, None))
-                continue
-
-            command_data_size = int.from_bytes(f.read(1), 'big')
-            command_data = read_exactly(f, command_data_size)
-
-            assert command_data_size > 0
-
-            commands.append((subcommand, endpoint_id, command_data))
-
-        remaining = f.read()
-
-        if remaining:
-            raise ValueError(f'Unparsed data remains at the end: {remaining}')
-
-        return commands
-
-    def encode_data(self):
-        if isinstance(self.data, (bytes, bytearray)):
-            return self.data
-            
-        assert isinstance(self.data, list)
-
-        result = b''
-        result += b'\xF1'
-        result += len(self.data).to_bytes(1, 'big')
-
-        for command_id, endpoint_id, data in self.data:
-            result += command_id.value.to_bytes(1, 'big')
-            result += endpoint_id.to_bytes(1, 'big')
-
-            if data is not None:
-                result += len(data).to_bytes(1, 'big')
-                result += data
-
-        return result
-
-    @classmethod
     def from_file(cls, f):
         assert read_exactly(f, 1) == b'\xE2'
 
@@ -139,6 +103,7 @@ class GEBusMessage:
         assert size >= 7
 
         source = int.from_bytes(read_exactly(f, 1), 'big')
+
         payload = read_exactly(f, size - 7)
 
         checksum = int.from_bytes(read_exactly(f, 2), 'big')
@@ -201,12 +166,9 @@ class GEBusMessage:
 
         return result
 
-    def to_bytes(self, *, escape=True):
+    def to_bytes(self):
         result = self._dump_until_checksum()
         result += self.crc16(result).to_bytes(2, 'big')
-
-        if escape:
-            result = result[:1] + escape_bytes(result[1:], b'\xE0', b'\xE0\xE1\xE2\xE3')
 
         result += b'\xE3'
         result += b'\xE1'
@@ -215,13 +177,7 @@ class GEBusMessage:
 
     def __repr__(self):
         lines = [f'<{self.__class__.__name__}(source=0x{self.source:02X}, destination=0x{self.destination:02X}, data=[']
-
-        if isinstance(self.data, list):
-            for command_name, endpoint_id, data in self.data:
-                lines.append(f'    ({command_name.name + ",":<13} 0x{endpoint_id:02X}, {data}),')
-        else:
-            lines.append(f'    {pretty_bytes(self.data)}')
-
+        lines.append(f'    {pretty_bytes(self.data)}')
         lines.append(']')
 
         return '\n'.join(lines)
@@ -372,17 +328,19 @@ class CasseroleProtocol(asyncio.Protocol):
         @self.events.on('packet:casserole')
         def casserole_handler(message):
             if message.type == CasseroleMessage.Commands.BUS_MESSAGE:
-                self.events.emit('packet:ge', GEBusMessage.from_bytes(message.payload))
+                try:
+                    self.events.emit('packet:ge', GEBusMessage.from_bytes(message.payload))
+                except (ValueError, AssertionError):
+                    logger.exception('Failed to parse supposedly valid GE packet: %s', pretty_bytes(message.payload))
+                    import IPython; IPython.embed()
+
             elif message.type == CasseroleMessage.Commands.SEND_BUS_MESSAGE_ERR:
                 logger.error('Caught an error: %s', message.payload)
         
         @self.events.on('packet:ge')
         def ge_handler(message):
             if message.source == 0x2D:
-                temp = GEBusMessage.from_bytes(message.to_bytes())
-                temp.data = GEBusMessage.parse_commands(message.data)
-
-                logger.debug('Read a bus message: %s', temp)
+                message.x
 
     async def send_casserole_message(self, message, accept=lambda m: True):
         async with self.send_lock:
@@ -398,7 +356,7 @@ class CasseroleProtocol(asyncio.Protocol):
                     self.events.off('packet:casserole', on_packet)
 
                 # We handle framing transparently
-                logger.debug('>>> %s', message)
+                logger.spam('>>> %s', message)
                 self.transport.write(TinyCOBS.encode(message.to_bytes()))
 
                 return await result_future
@@ -423,13 +381,11 @@ class CasseroleProtocol(asyncio.Protocol):
         raise CasseroleError('Could not send the message')
 
     async def _broadcast_ge_message(self, message):
-        outer = CasseroleMessage(CasseroleMessage.Commands.SEND_BUS_MESSAGE, message.to_bytes(escape=True))
+        outer = CasseroleMessage(CasseroleMessage.Commands.SEND_BUS_MESSAGE, message.to_bytes())
         results = asyncio.Queue()
 
         @self.events.on('packet:ge')
         def on_packet(rx_message):
-            print(f'Got a packet from 0x{rx_message.source:02X} to 0x{rx_message.destination:02X} with payload {pretty_bytes(rx_message.encode_data())}')
-
             if message.destination != 0xFF and rx_message.source != message.destination:
                 return
 
@@ -489,7 +445,7 @@ class CasseroleProtocol(asyncio.Protocol):
                 logger.error('Caught an error while reading packet! Discarding...')
                 continue
 
-            logger.debug('<<< %s', parsed_message)
+            logger.spam('<<< %s', parsed_message)
 
             self.events.emit('packet:casserole', parsed_message)
 
@@ -502,42 +458,20 @@ async def main(adapter):
     transport, protocol = await serial_asyncio.create_serial_connection(loop, CasseroleProtocol, adapter, baudrate=115200)
 
     while not protocol.transport:
-        logger.warning('Waiting to connect...')
+        logger.info('Waiting to connect...')
         await asyncio.sleep(1)
 
     await protocol.ping()
 
-    logger.warning('Sending a broadcast to identify devices...')
+    logger.info('Sending a broadcast to identify devices...')
+    response = await protocol.send_ge_message(GEBusMessage(source=0x1C, destination=0xFF, data=b'\x01'), retry=5, timeout=2)
+    address, version = response.source, response.data
 
-    async for response in protocol.broadcast_ge_message(GEBusMessage(source=0x1B, destination=0xFF, data=b'\x01'), retry=1000, timeout=0.5):
-        endpoint, version = response.source, response.data
-        break
+    logger.info('Found an appliance version %r at 0x%0.2X', version, address)
 
-    logger.warning('Found an appliance version %r at 0x%0.2X', version, endpoint)
+    await asyncio.sleep(100000)
 
-
-    for i in range(1000):
-        cycle = await protocol.send_ge_message(GEBusMessage(
-            source=0x1B,
-            destination=endpoint,
-            data=b'\xf0' + b'\x01' + (0x200A).to_bytes(2, 'big')
-        ), retry=1000, timeout=0.5)
-
-        logger.warning('Current selected cycle is %s', cycle.data)
-        await asyncio.sleep(1)
-
-        for i in range(0, 100):
-            logger.warning('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-            cycle = await protocol.send_ge_message(GEBusMessage(
-                source=0x1B,
-                destination=endpoint,
-                data=b'\xf1' + b'\x01' + (0x2000 + i).to_bytes(2, 'big') + b'\x01\x01'
-            ), retry=1000, timeout=0.5)
-
-            logger.warning('Current selected cycle is %s', cycle.data)
-            await asyncio.sleep(1)
-
-
+    await asyncio.sleep(0)
 
 if __name__ == '__main__':
     asyncio.run(main(sys.argv[1]))

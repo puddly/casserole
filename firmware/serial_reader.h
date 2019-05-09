@@ -79,10 +79,14 @@ class SerialReaderState {
 		}
 
 		uint8_t* get_payload() {
+			if (size < 3) {
+				return nullptr;
+			}
+
 			return &body[2];
 		}
 
-		uint8_t* get_payload_size() {
+		uint8_t get_payload_size() {
 			return size - 2 - 2;
 		}
 };

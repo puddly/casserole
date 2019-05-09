@@ -113,7 +113,7 @@ BusReaderResult read_bus_byte(BusReaderState &state, Stream &stream) {
 		state.escape_next_byte = false;
 
 		return BusReaderResult{BusReaderResult::State::READING, "Read escaped"};
-	} else if (byte == 0xE0) {
+	} else if ((byte == 0xE0) && (state.size > 2)) {
 		// Escape the next byte but don't write this current one, since it's not included in the CRC or the length
 		state.escape_next_byte = true;
 

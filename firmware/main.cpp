@@ -1,22 +1,24 @@
 #include <Arduino.h>
-
-#include "SoftwareSerial/SoftwareSerial.h"
-
-//#include "AltSoftSerial/AltSoftSerial.h"
-//#include "AltSoftSerial/config/AltSoftSerial_Boards.h"
-//#include "AltSoftSerial/config/AltSoftSerial_Timers.h"
+#include <HardwareSerial.h>
 
 #include "bus_reader.h"
 #include "serial_reader.h"
 
 
+constexpr uint32_t SERIAL_BAUD = 115200;
+
+
+// ESP-32 hardware serial
+#define ge_serial Serial2
+
+constexpr uint8_t BUS_RX_ENABLE_PIN = 32;
+constexpr uint8_t BUS_TX_ENABLE_PIN = 33;
+
+constexpr uint8_t BUS_RX_PIN = 16;
+constexpr uint8_t BUS_TX_PIN = 17;
+
 constexpr uint32_t BUS_BAUD = 19200;
 constexpr uint32_t BUS_SEND_DELAY_MICROS = 13000;  // min. quiet time before transmitting
-constexpr uint32_t BUS_SEND_TIMEOUT_MICROS = 2000000; // 2 seconds
-
-// These two pins are tied together
-constexpr uint8_t COMM_RX_PIN = 8;
-constexpr uint8_t COMM_TX_PIN = 9;
 
 
 namespace CasseroleMessage {
@@ -36,9 +38,6 @@ namespace CasseroleMessage {
 	constexpr uint8_t HEARTBEAT = 0xFE;
 	constexpr uint8_t DEBUG = 0xDE;
 };
-
-
-SoftwareSerial ge_serial(COMM_RX_PIN, COMM_TX_PIN, true);  // inverted logic
 
 
 void send_to_computer(uint8_t type, uint8_t size, uint8_t *payload) {
@@ -74,26 +73,37 @@ void send_to_computer(uint8_t type, uint8_t size, uint8_t *payload) {
 	Serial.write(buffer, 4 + size + 1);
 
 	// Timing for these messages isn't that important
-	//Serial.flush();
+	Serial.flush();
 }
 
 void send_to_computer(uint8_t type) {
 	send_to_computer(type, 0x00, nullptr);
 }
 
+void set_transmit(bool tx) {
+	// inverted logic, so LOW=enabled, HIGH=disabled
+	if (tx) {
+		digitalWrite(BUS_RX_ENABLE_PIN, HIGH);
+		digitalWrite(BUS_TX_ENABLE_PIN, LOW);
+	} else {
+		digitalWrite(BUS_TX_ENABLE_PIN, HIGH);
+		digitalWrite(BUS_RX_ENABLE_PIN, LOW);
+	}
+}
+
 void setup() {
-	// Open serial communications and wait for the port to open
-	Serial.begin(115200);
+	Serial.begin(SERIAL_BAUD);
 
 	while (!Serial) {
 		// Hardware serial isn't ready yet
 	}
 
-	ge_serial.begin(BUS_BAUD);
+	set_transmit(false);
+	pinMode(BUS_RX_ENABLE_PIN, OUTPUT);
+	pinMode(BUS_TX_ENABLE_PIN, OUTPUT);
+	set_transmit(false);
 
-	digitalWrite(COMM_TX_PIN, LOW);
-	pinMode(COMM_RX_PIN, INPUT);  // Disable the AltSoftSerial pullup
-	pinMode(COMM_TX_PIN, INPUT);  // Disable TX until we enable it
+	ge_serial.begin(BUS_BAUD, SERIAL_8N1, BUS_RX_PIN, BUS_TX_PIN);
 
 	delay(500);
 	send_to_computer(CasseroleMessage::PING);
@@ -157,6 +167,9 @@ void loop() {
 	static SerialReaderState serial_reader_state;
 
 	if (waiting_to_send) {
+		uint8_t payload_size = serial_reader_state.get_payload_size();
+		uint8_t* payload = serial_reader_state.get_payload();
+
 		switch (serial_reader_state.get_type_from_header()) {
 			case CasseroleMessage::PING:
 				send_to_computer(CasseroleMessage::PING);
@@ -171,21 +184,34 @@ void loop() {
 					break;
 				}
 
-				ge_serial.stopListening();
-
 				// Enable TX
-				digitalWrite(COMM_TX_PIN, LOW);
-				pinMode(COMM_TX_PIN, OUTPUT);
+				set_transmit(true);
 
-				ge_serial.write(serial_reader_state.get_payload(), serial_reader_state.get_payload_size());
+				// Write the Header
+				ge_serial.write(payload, 3);
+
+				// We handle escaping/unescaping in here so the computer-side code never deals with it
+				for (uint8_t i = 3; i < payload_size - 2; i++) {
+					uint8_t byte = payload[i];
+
+					if ((byte == 0xE0) || (byte == 0xE1) || (byte == 0xE2) || (byte == 0xE3)) {
+						// Escape the byte before writing it
+						ge_serial.write(0xE0);
+					}
+
+					ge_serial.write(byte);
+				}
+
+				// Write the footer
+				ge_serial.write(payload + (payload_size - 2), 2);
+
+				// Flush before we disable transmission
+				ge_serial.flush();
 
 				// Disable TX
-				digitalWrite(COMM_TX_PIN, LOW);
-				pinMode(COMM_TX_PIN, INPUT);
+				set_transmit(false);
 
-				ge_serial.listen();
-
-				// We just sent a packet so reset it
+				// We just sent a packet so reset the timer
 				last_byte_time = micros();
 				send_to_computer(CasseroleMessage::SEND_BUS_MESSAGE_TX);
 
@@ -217,7 +243,7 @@ void loop() {
 				} else if (serial_read_result.result == SerialReaderResult::INVALID) {
 					serial_reader_state.reset();
 
-					send_to_computer(CasseroleMessage::SEND_BUS_MESSAGE_ERR, strlen(serial_read_result.message), serial_read_result.message);
+					send_to_computer(CasseroleMessage::SEND_BUS_MESSAGE_ERR, strlen(serial_read_result.message), (uint8_t*)serial_read_result.message);
 
 					// Something is wrong, wait until the next frame to try again
 					resync = true;
