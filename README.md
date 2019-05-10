@@ -1,20 +1,25 @@
 # Casserole
-An open source alternative to the now-defunct [Green Bean adapter](https://github.com/GEMakers/green-bean) to monitor and control GE appliances.
+An open source alternative to the now-defunct [Green Bean adapter](https://github.com/GEMakers/green-bean) to monitor and control GE appliances over their RJ45 port.
 
 ## What works
-1. All bus messages and are sent back to the computer, including ones sent by the appliance user input boards.
+1. All bus messages are sent back to the computer, including ones sent by the appliance user input boards.
 2. Messages can be sent to the bus.
 
 ## What doesn't work
-1. Message transmission is unreliable (I suspect my Arduino Pro Mini isn't fast enough), although checksums prevent corrupted messages from being sent or received.
-2. GE/FirstBuild's open source SDK is incomplete and does not document any way to remotely start some appliances (like my washer).
+1. Other devices occasionally interrupt the adapter's messages. I'm not sure how devices take turns when sending data over the bus.
+2. GE/FirstBuild's open source SDK is incomplete and does not document any way to remotely start some appliances (like my washer). In theory, this should still be possible by having the adapter briefly pretend to be the input board.
+
+## Hardware
+I know very little about hardware and making proper diagrams. The bus is being pulled down to ground instead of up to 5V which makes most level shifters difficult to use with 3.3V microcontrollers. I'm using [an inverter](https://www.ti.com/lit/ds/symlink/sn74ahct14.pdf), [a level shifter](https://www.adafruit.com/product/757), and [a buffer with 3-state outputs](https://www.ti.com/lit/ds/symlink/sn74ahct125.pdf) to make it possible for an ESP-32 to communicate over the bus with its hardware serial port. Please open an issue if you know of a simple way to hook 3.3V microcontrollers up to the bus.
+
+[insert crude diagram here]
 
 ## Low-level details
 
 ### RJ45 Port
 The RJ45 (Ethernet) port on some GE appliances exposes a bus that allows for communication with the appliance's controller board. The three pins are labeled `GND`, `COMM`, and `9V`.
 
-The COMM bus uses 5V logic and is an *inverted* logic UART at 19,200 baud.
+The COMM bus uses 5V logic and is an inverted UART at 19,200 baud.
 
 ### Protocol
 I've been unable to acquire an actual Green Bean module so all of the information here is based on what I can capture from my washing machine. Here is a sample packet:
