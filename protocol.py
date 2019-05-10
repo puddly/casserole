@@ -15,44 +15,7 @@ import coloredlogs
 from verboselogs import VerboseLogger
 
 logger = VerboseLogger(__name__)
-coloredlogs.install(level='SPAM')
-
-
-class EscapedStream:
-    def __init__(self, f):
-        self.f = f
-
-    def read(self, n=-1):
-        results = bytearray()
-
-        while n != 0:
-            b = self.f.read(1)
-
-            if not b:
-                break
-
-            if b in b'\xe1\xe2\xe3':
-                raise ValueError('Unescaped control character')
-            elif b == b'\xe0':
-                b = self.f.read(1)
-
-                if not b:
-                    raise ValueError('Truncated escape sequence')
-
-                if b not in b'\xe1\xe2\xe3':
-                    raise ValueError('Invalid escape sequence')
-
-            results.append(b)
-            n -= 1
-
-        return results
-
-    def write(self, data):
-        for byte in data:
-            if byte in b'\xe0\xe1\xe2\xe3':
-                self.f.write(bytes([0xe0, byte]))
-            else:
-                self.f.write(byte)
+coloredlogs.install(level='DEBUG')
 
 
 def read_exactly(f, size):
@@ -78,19 +41,10 @@ class CasseroleError(ValueError):
 
 
 class GEBusMessage:
-    class Commands(enum.Enum):
-        READ = 0xF0
-        WRITE = 0xF1
-        SUBSCRIBE = 0xF2
-        SUBSCRIBE_LIST = 0xF3
-        UNSUBSCRIBE = 0xF4
-        PUBLISH = 0xF5
-
-        UNKNOWN = 0xFFFF
-
-    def __init__(self, source, destination, data):
+    def __init__(self, source, destination, command, data):
         self.source = source
         self.destination = destination
+        self.command = command
         self.data = data
 
     @classmethod
@@ -104,13 +58,14 @@ class GEBusMessage:
 
         source = int.from_bytes(read_exactly(f, 1), 'big')
 
-        payload = read_exactly(f, size - 7)
+        command = int.from_bytes(read_exactly(f, 1), 'big')
+        data = read_exactly(f, size - 8)
 
         checksum = int.from_bytes(read_exactly(f, 2), 'big')
 
         assert read_exactly(f, 1) == b'\xE3'
 
-        message = cls(source, destination, payload)
+        message = cls(source, destination, command, data)
         assert message.checksum == checksum
 
         return message
@@ -160,15 +115,17 @@ class GEBusMessage:
         result = b''
         result += b'\xE2'
         result += self.destination.to_bytes(1, 'big')
-        result += (1 + 1 + 1 + 1 + len(self.encode_data()) + 2 + 1).to_bytes(1, 'big')
+        result += (1 + 1 + 1 + 1 + 1 + len(self.data) + 2 + 1).to_bytes(1, 'big')
         result += self.source.to_bytes(1, 'big')
-        result += self.encode_data()
+        result += self.command.to_bytes(1, 'big')
+        result += self.data
 
         return result
 
     def to_bytes(self):
-        result = self._dump_until_checksum()
-        result += self.crc16(result).to_bytes(2, 'big')
+        result = b''
+        result += self._dump_until_checksum()
+        result += self.checksum.to_bytes(2, 'big')
 
         result += b'\xE3'
         result += b'\xE1'
@@ -176,9 +133,98 @@ class GEBusMessage:
         return result
 
     def __repr__(self):
-        lines = [f'<{self.__class__.__name__}(source=0x{self.source:02X}, destination=0x{self.destination:02X}, data=[']
+        lines = [f'<{self.__class__.__name__}(source=0x{self.source:02X}, destination=0x{self.destination:02X}, command=0x{self.command:02X}, data=[']
         lines.append(f'    {pretty_bytes(self.data)}')
-        lines.append(']')
+        lines.append(']>')
+
+        return '\n'.join(lines)
+
+
+class GEBusMessageCommands:
+    class Commands(enum.Enum):
+        READ = 0xF0
+        WRITE = 0xF1
+        SUBSCRIBE = 0xF2
+        SUBSCRIBE_LIST = 0xF3
+        UNSUBSCRIBE = 0xF4
+        PUBLISH = 0xF5
+
+    def __init__(self, commands):
+        self.commands = commands
+
+    @classmethod
+    def from_bytes(cls, data):
+        f = BytesIO(data)
+        commands = cls.from_file(f)
+        remaining = f.read()
+
+        if remaining:
+            raise ValueError(f'Unused data remains at the end: {remaining}')
+
+        return commands
+
+    @classmethod
+    def from_file(cls, f):
+        count = int.from_bytes(read_exactly(f, 1), 'big')
+        commands = []
+
+        next_byte = None
+
+        for i in range(count):
+            if next_byte is not None:
+                subcommand_byte = next_byte
+                next_byte = None
+            else:
+                subcommand_byte = read_exactly(f, 1)
+
+            subcommand = cls.Commands(int.from_bytes(subcommand_byte, 'big'))
+            endpoint_id = int.from_bytes(read_exactly(f, 1), 'big')
+
+            # It's OK not to read anything here
+            next_byte = f.read(1)
+
+            if not next_byte or any(next_byte[0] == m.value for m in cls.Commands.__members__.values()):
+                commands.append((subcommand, endpoint_id, None))
+                continue
+
+            size = int.from_bytes(next_byte, 'big')
+            next_byte = None
+
+            data = read_exactly(f, size)
+
+            commands.append((subcommand, endpoint_id, data))
+
+        return cls(commands)
+
+    def to_bytes(self):
+        result = b''
+        result += len(self.commands).to_bytes(1, 'big')
+
+        for command, endpoint_id, data in self.commands:
+            result += command.value.to_bytes(1, 'big')
+            result += endpoint_id.to_bytes(1, 'big')
+
+            if data is not None:
+                result += len(data).to_bytes(1, 'big')
+                result += data
+
+        return result
+
+    def __repr__(self):
+        lines = [f'<{self.__class__.__name__}(commands=[']
+
+        for command, endpoint_id, data in self.commands:
+            if (data is not None and command == self.Commands.READ) or (data is None and command != self.Commands.READ):
+                command_name = f'{command.name}_RESP'
+            else:
+                command_name = command.name
+
+            if data is not None:
+                lines.append(f'    {command_name:>14}(endpoint=0x{endpoint_id:02X}, data=[{pretty_bytes(data)}])')
+            else:
+                lines.append(f'    {command_name:>14}(endpoint=0x{endpoint_id:02X})')
+
+        lines.append(']>')
 
         return '\n'.join(lines)
 
@@ -328,19 +374,52 @@ class CasseroleProtocol(asyncio.Protocol):
         @self.events.on('packet:casserole')
         def casserole_handler(message):
             if message.type == CasseroleMessage.Commands.BUS_MESSAGE:
-                try:
-                    self.events.emit('packet:ge', GEBusMessage.from_bytes(message.payload))
-                except (ValueError, AssertionError):
-                    logger.exception('Failed to parse supposedly valid GE packet: %s', pretty_bytes(message.payload))
-                    import IPython; IPython.embed()
-
+                self.events.emit('packet:ge', GEBusMessage.from_bytes(message.payload))
             elif message.type == CasseroleMessage.Commands.SEND_BUS_MESSAGE_ERR:
                 logger.error('Caught an error: %s', message.payload)
-        
+
+        states = defaultdict(lambda: defaultdict(bytes))
+
         @self.events.on('packet:ge')
         def ge_handler(message):
-            if message.source == 0x2D:
-                message.x
+            if message.command != 0xF1:
+                logger.warning('Unknown command type: %x', message.command)
+                return
+
+            KNOBS = 0x2D
+            BOARD = 0x23
+
+            if message.source in (KNOBS, BOARD) and message.destination in (BOARD, KNOBS):
+                commands = GEBusMessageCommands.from_bytes(message.data)
+
+                important = (message.destination == 0x23 and any(ep == 0x2e for _, ep, _ in commands.commands))
+
+                for command, endpoint_id, data in commands.commands:
+                    if command == GEBusMessageCommands.Commands.WRITE and data is not None:
+                        # This is some kind of rolling counter
+                        if endpoint_id == 0x33:
+                            continue
+
+                        current_value = states[message.destination][endpoint_id]
+
+                        if not important and current_value == data:
+                            continue
+
+                        if important or not (message.source == 0x23 and message.destination == 0x2d and endpoint_id == 0x19):
+                            logger.debug('%x wrote to %x endpoint %x=[%s]', message.source, message.destination, endpoint_id, pretty_bytes(data))
+
+                        states[message.destination][endpoint_id] = data
+                    elif command == GEBusMessageCommands.Commands.READ and data is not None:
+                        current_value = states[message.source][endpoint_id]
+
+                        if not important and current_value == data:
+                            continue
+
+                        logger.debug('%x read from %x ep %x unexpected value %s', message.source, message.destination, endpoint_id, pretty_bytes(data))
+                        states[message.source][endpoint_id] = data
+                        
+
+                
 
     async def send_casserole_message(self, message, accept=lambda m: True):
         async with self.send_lock:
@@ -392,9 +471,8 @@ class CasseroleProtocol(asyncio.Protocol):
             if rx_message.destination != message.source:
                 return
 
-            # XXX: Expose the command properly
-            #if rx_message.data[0] != message.data[0]:
-            #    return
+            if rx_message.command != message.command:
+                return
 
             results.put_nowait(rx_message)
 
@@ -453,6 +531,53 @@ class CasseroleProtocol(asyncio.Protocol):
         pass
 
 
+class StackedWasherControls:
+    class Endpoints(enum.Enum):
+        LIGHT_ON = 0x11
+        LIGHT_WASH = 0x12
+        LIGHT_RINSE = 0x13
+        LIGHT_SPIN = 0x14
+        LIGHT_LID_LOCKED = 0x15
+
+    class Events(enum.Enum):
+        BUTTON_START_PRESSED = 0x01
+        BUTTON_START_RELEASED = 0x02
+
+        BUTTON_DEEP_RINSE_PRESSED = 0x03
+        BUTTON_DEEP_RINSE_RELEASED = 0x04
+
+        KNOB_CYCLES_OFF = 0x05
+        KNOB_CYCLES_DRAIN_AND_SPIN = 0x06
+        KNOB_CYCLES_SPEED_WASH = 0x07
+        KNOB_CYCLES_DELICATES = 0x08
+        KNOB_CYCLES_CASUALS = 0x09
+        KNOB_CYCLES_BULKY_ITEMS = 0x0A
+
+        KNOB_CYCLES_WHITES_HEAVY = 0x0B
+        KNOB_CYCLES_WHITES_MEDIUM = 0x0C
+        KNOB_CYCLES_WHITES_LIGHT = 0x0D
+
+        KNOB_CYCLES_COLORS_HEAVY = 0x0E
+        KNOB_CYCLES_COLORS_MEDIUM = 0x0F
+        KNOB_CYCLES_COLORS_LIGHT = 0x10
+
+        KNOB_TEMPERATURE_TAP_COLD = 0x11
+        KNOB_TEMPERATURE_HOT = 0x12
+        KNOB_TEMPERATURE_WARM = 0x13
+        KNOB_TEMPERATURE_COLORS = 0x14
+        KNOB_TEMPERATURE_COOL = 0x15
+        KNOB_TEMPERATURE_COLD = 0x16
+
+        KNOB_OPTIONS_OFF = 0x17
+        KNOB_OPTIONS_2ND_RINSE = 0x18
+        KNOB_OPTIONS_PRE_SOAK_AND_2ND_RINSE = 0x19
+        KNOB_OPTIONS_UNPOPULATED = 0x1A
+        KNOB_OPTIONS_PRE_SOAK_15_MIN = 0x1B
+
+
+
+
+
 async def main(adapter):
     loop = asyncio.get_event_loop()
     transport, protocol = await serial_asyncio.create_serial_connection(loop, CasseroleProtocol, adapter, baudrate=115200)
@@ -464,10 +589,63 @@ async def main(adapter):
     await protocol.ping()
 
     logger.info('Sending a broadcast to identify devices...')
-    response = await protocol.send_ge_message(GEBusMessage(source=0x1C, destination=0xFF, data=b'\x01'), retry=5, timeout=2)
+    response = await protocol.send_ge_message(GEBusMessage(source=0x1C, destination=0xFF, command=0x01, data=b''), retry=5, timeout=2)
     address, version = response.source, response.data
 
     logger.info('Found an appliance version %r at 0x%0.2X', version, address)
+
+    logger.info('Turning on lid lock light (briefly)...')
+    try:
+        await protocol.send_ge_message(GEBusMessage(
+            source=0x1C,
+            destination=0x2D,
+            command=0xF1,
+            data=GEBusMessageCommands([
+                (GEBusMessageCommands.Commands.WRITE, StackedWasherControls.Endpoints.LIGHT_LID_LOCKED.value, b'\x01'),
+            ]).to_bytes()
+        ), retry=1, timeout=0.1)
+    except CasseroleError:
+        pass
+
+
+    logger.info('Simulating a button press!')
+    try:
+        num_interactions = 0x03
+
+        knobs_state = b''
+        knobs_state += b'\x0A'  # Number of interactions from boot, capped at 10 == 0x0a
+        knobs_state += num_interactions.to_bytes(1, 'big')  # Total number of interactions
+        knobs_state += b'\x01'  # Always 0x01. Maybe set if the controller knows its own state?
+        knobs_state += bytearray([    # Last 10 events, in order
+            StackedWasherControls.Events.BUTTON_START_RELEASED.value,
+            StackedWasherControls.Events.BUTTON_START_PRESSED.value,
+
+            StackedWasherControls.Events.KNOB_CYCLES_DRAIN_AND_SPIN.value,
+            StackedWasherControls.Events.KNOB_TEMPERATURE_COLORS.value,
+            StackedWasherControls.Events.KNOB_OPTIONS_PRE_SOAK_AND_2ND_RINSE.value,
+
+            # Padding, though it seems to be a sequence of valid inputs
+            StackedWasherControls.Events.KNOB_CYCLES_OFF.value,
+            StackedWasherControls.Events.KNOB_CYCLES_DRAIN_AND_SPIN.value,
+            StackedWasherControls.Events.KNOB_CYCLES_OFF.value,
+            StackedWasherControls.Events.KNOB_CYCLES_DRAIN_AND_SPIN.value,
+            StackedWasherControls.Events.KNOB_CYCLES_OFF.value,
+        ])
+
+        knobs_state += b'\x0a'
+
+
+        await protocol.send_ge_message(GEBusMessage(
+            source=0x2D,
+            destination=0x23,
+            command=0xF1,
+            data=GEBusMessageCommands([
+                (GEBusMessageCommands.Commands.WRITE, 0x2E, knobs_state),
+                (GEBusMessageCommands.Commands.WRITE, 0x39, num_interactions.to_bytes(1, 'big')),  # Min packet ID??
+            ]).to_bytes()
+        ), retry=1, timeout=0.1)
+    except CasseroleError:
+        pass
 
     await asyncio.sleep(100000)
 
