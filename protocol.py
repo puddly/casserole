@@ -594,62 +594,104 @@ async def main(adapter):
 
     logger.info('Found an appliance version %r at 0x%0.2X', version, address)
 
-    logger.info('Turning on lid lock light (briefly)...')
+
+
+    # Capture a packet from the knobs board to steal its counter
+    logger.info('Waiting for packet from knobs board...')
+    sample_commands_future = loop.create_future()
+
+    # XXX: wrap this in a function
+    @protocol.events.on('packet:ge')
+    def on_packet(m):
+        if not (m.destination == 0x23 and m.source == 0x2D and m.command == 0xF1):
+            return
+
+        commands = GEBusMessageCommands.from_bytes(m.data).commands
+
+        # We need both a knobs state write and a "packet id" write
+        try:
+            knobs_state_data = next(data for command, endpoint, data in commands if command == GEBusMessageCommands.Commands.WRITE and endpoint == 0x2E)
+            unknown = next(data for command, endpoint, data in commands if command == GEBusMessageCommands.Commands.WRITE and endpoint == 0x39)
+        except StopIteration:
+            return
+
+        sample_commands_future.set_result((knobs_state_data, int.from_bytes(unknown, 'big')))
+
     try:
-        await protocol.send_ge_message(GEBusMessage(
-            source=0x1C,
-            destination=0x2D,
-            command=0xF1,
-            data=GEBusMessageCommands([
-                (GEBusMessageCommands.Commands.WRITE, StackedWasherControls.Endpoints.LIGHT_LID_LOCKED.value, b'\x01'),
-            ]).to_bytes()
-        ), retry=1, timeout=0.1)
-    except CasseroleError:
-        pass
+        knobs_state_data, unknown = await sample_commands_future
+    finally:
+        protocol.events.off('packet:ge', on_packet)
 
+    # We parse the knobs state so that we can simulate a few buttons being pressed
+    f = BytesIO(knobs_state_data)
+    num_interactions_in_packet = int.from_bytes(read_exactly(f, 1), 'big')
+    num_interactions = int.from_bytes(read_exactly(f, 1), 'big')
+    unknown2 = int.from_bytes(read_exactly(f, 1), 'big')
 
-    logger.info('Simulating a button press!')
-    try:
-        num_interactions = 0x03
+    knobs_state = [StackedWasherControls.Events(s) for s in read_exactly(f, 10)[:num_interactions_in_packet]]
+    trailer = read_exactly(f, 1)
 
-        knobs_state = b''
-        knobs_state += b'\x0A'  # Number of interactions from boot, capped at 10 == 0x0a
-        knobs_state += num_interactions.to_bytes(1, 'big')  # Total number of interactions
-        knobs_state += b'\x01'  # Always 0x01. Maybe set if the controller knows its own state?
-        knobs_state += bytearray([    # Last 10 events, in order
-            StackedWasherControls.Events.BUTTON_START_RELEASED.value,
-            StackedWasherControls.Events.BUTTON_START_PRESSED.value,
+    logger.info('Knobs board replied with packet #%r with unknown %r and state %r', num_interactions, unknown, knobs_state)
 
-            StackedWasherControls.Events.KNOB_CYCLES_DRAIN_AND_SPIN.value,
-            StackedWasherControls.Events.KNOB_TEMPERATURE_COLORS.value,
-            StackedWasherControls.Events.KNOB_OPTIONS_PRE_SOAK_AND_2ND_RINSE.value,
+    # Simulate a few button presses. This assumes we set the knobs to their correct positions.
+    for interaction in [
+        StackedWasherControls.Events.BUTTON_START_RELEASED,
+        StackedWasherControls.Events.BUTTON_START_PRESSED,
 
-            # Padding, though it seems to be a sequence of valid inputs
-            StackedWasherControls.Events.KNOB_CYCLES_OFF.value,
-            StackedWasherControls.Events.KNOB_CYCLES_DRAIN_AND_SPIN.value,
-            StackedWasherControls.Events.KNOB_CYCLES_OFF.value,
-            StackedWasherControls.Events.KNOB_CYCLES_DRAIN_AND_SPIN.value,
-            StackedWasherControls.Events.KNOB_CYCLES_OFF.value,
-        ])
+        # Pressing the deep rinse button is necessary only to wake it up.
+        # Ideally, we should check to see if the machine is awake is active beforehand
+        StackedWasherControls.Events.BUTTON_DEEP_RINSE_RELEASED,
+        StackedWasherControls.Events.BUTTON_DEEP_RINSE_PRESSED,
+    ][::-1]:
+        # Send these one at a time
+        num_interactions = (num_interactions + 1) % 0xFF
+        knobs_state = [interaction] + knobs_state[:9]
 
-        knobs_state += b'\x0a'
+        knobs_state_packet = b''
+        knobs_state_packet += max(num_interactions, 10).to_bytes(1, 'big')  # Number of interactions in this packet
+        knobs_state_packet += num_interactions.to_bytes(1, 'big')  # Total number of interactions
+        knobs_state_packet += unknown2.to_bytes(1, 'big')  # Always 0x01. Maybe set if the controller knows its own state?
+        knobs_state_packet += bytearray([e.value for e in knobs_state])
 
+        knobs_state_packet += trailer
 
-        await protocol.send_ge_message(GEBusMessage(
-            source=0x2D,
-            destination=0x23,
-            command=0xF1,
-            data=GEBusMessageCommands([
-                (GEBusMessageCommands.Commands.WRITE, 0x2E, knobs_state),
-                (GEBusMessageCommands.Commands.WRITE, 0x39, num_interactions.to_bytes(1, 'big')),  # Min packet ID??
-            ]).to_bytes()
-        ), retry=1, timeout=0.1)
-    except CasseroleError:
-        pass
+        try:
+            await protocol.send_ge_message(GEBusMessage(
+                source=0x2D,
+                destination=0x23,
+                command=0xF1,
+                data=GEBusMessageCommands([
+                    (GEBusMessageCommands.Commands.WRITE, 0x2E, knobs_state_packet),
+                    (GEBusMessageCommands.Commands.WRITE, 0x39, num_interactions.to_bytes(1, 'big')),  # Min packet ID??
+                ]).to_bytes()
+            ), retry=1, timeout=0.1)
+        except CasseroleError:
+            pass
+
+    # Finally, reset the counter. This gets the controller board to respect the knobs
+    for num_interactions in [0xFE, 0xFF, 0x00, 0x01]:
+        knobs_state_packet = b''
+        knobs_state_packet += max(num_interactions, 10).to_bytes(1, 'big')  # Number of interactions in this packet
+        knobs_state_packet += num_interactions.to_bytes(1, 'big')  # Total number of interactions
+        knobs_state_packet += unknown2.to_bytes(1, 'big')  # Always 0x01. Maybe set if the controller knows its own state?
+        knobs_state_packet += bytearray([e.value for e in knobs_state])
+
+        knobs_state_packet += trailer
+
+        try:
+            await protocol.send_ge_message(GEBusMessage(
+                source=0x2D,
+                destination=0x23,
+                command=0xF1,
+                data=GEBusMessageCommands([
+                    (GEBusMessageCommands.Commands.WRITE, 0x2E, knobs_state_packet),
+                    (GEBusMessageCommands.Commands.WRITE, 0x39, num_interactions.to_bytes(1, 'big')),  # Min packet ID??
+                ]).to_bytes()
+            ), retry=1, timeout=0.1)
+        except CasseroleError:
+            pass
 
     await asyncio.sleep(100000)
-
-    await asyncio.sleep(0)
 
 if __name__ == '__main__':
     asyncio.run(main(sys.argv[1]))
