@@ -1,5 +1,27 @@
 # Casserole
-An open source alternative to the now-defunct [Green Bean adapter](https://github.com/GEMakers/green-bean) to monitor and control GE appliances over their RJ45 port.
+An open source alternative to the now-defunct [Green Bean adapter](https://github.com/GEMakers/green-bean) to monitor and control GE appliances through their RJ45 port.
+
+# Installation
+
+```sh
+# Clone the repo
+git clone https://github.com/puddly/casserole
+cd casserole
+
+# Setup a new virtual Python env (optional but recommended)
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Compile and upload the firmware to your ESP32
+platformio run -t upload -v -e esp32 --upload-port=/dev/cu.SLAB_USBtoUART
+
+# Run the host software and see what your appliance is doing
+python protocol.py
+```
+
 
 ## What works
 1. All bus messages are sent back to the computer, including ones sent by the appliance user input boards.
@@ -7,12 +29,25 @@ An open source alternative to the now-defunct [Green Bean adapter](https://githu
 
 ## What doesn't work
 1. Other devices occasionally interrupt the adapter's messages. I'm not sure how devices take turns when sending data over the bus.
-2. GE/FirstBuild's open source SDK is incomplete and does not document any way to remotely start some appliances (like my washer). In theory, this should still be possible by having the adapter briefly pretend to be the input board.
+2. GE/FirstBuild's open source SDK is incomplete and does not document any way to remotely start some appliances (like my washer).
 
 ## Hardware
-I know very little about hardware and making proper diagrams. The bus is being pulled down to ground instead of up to 5V which makes most level shifters difficult to use with 3.3V microcontrollers. I'm using [an inverter](https://www.ti.com/lit/ds/symlink/sn74ahct14.pdf), [a level shifter](https://www.adafruit.com/product/757), and [a buffer with 3-state outputs](https://www.ti.com/lit/ds/symlink/sn74ahct125.pdf) to make it possible for an ESP-32 to communicate over the bus with its hardware serial port. Please open an issue if you know of a simple way to hook 3.3V microcontrollers up to the bus.
+I don't know much about building electronics but here are the parts I've used:
 
-[insert crude diagram here]
+ - ESP32 dev kit ([I use this one with built-in RGB LEDs](https://www.tindie.com/products/ddebeer/esp32-dev-board-wifibluetooth/) but any should work)
+ - 3.3v to 5V bus transceiver ([TI SN74LVC2T45](https://www.ti.com/lit/ds/symlink/sn74lvc2t45.pdf))
+ - 5V regulator ([ST LD1117](https://www.st.com/content/ccc/resource/technical/document/datasheet/99/3b/7d/91/91/51/4b/be/CD00000544.pdf/files/CD00000544.pdf/jcr:content/translations/en.CD00000544.pdf), though just about any should work). I've read that the ESP32 can draw up to 600mA in 100ms bursts when in AP mode but ordinarily draws about 40mA.
+
+Wiring:
+
+ - Regulate the 9V from the GE bus down to 5V and connect it both your ESP32's `Vin` pin and to the high voltage input of the bus transceiver.
+ - Connect the ESP32's 3.3V pin to the low voltage input of the bus transceiver.
+ - Tie together the ESP32's second UART's RX and TX pins (16 and 17) and connect them to the low voltage input of the bus transceiver.
+ - Connect pin 18 (though any will work) to the direction control of the bus transceiver.
+
+```
+[insert proper diagram here]
+```
 
 ## Low-level details
 

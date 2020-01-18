@@ -7,18 +7,31 @@
 
 constexpr uint32_t SERIAL_BAUD = 115200;
 
-
-// ESP-32 hardware serial
-#define ge_serial Serial2
-
-constexpr uint8_t BUS_RX_ENABLE_PIN = 32;
-constexpr uint8_t BUS_TX_ENABLE_PIN = 33;
-
-constexpr uint8_t BUS_RX_PIN = 16;
-constexpr uint8_t BUS_TX_PIN = 17;
-
 constexpr uint32_t BUS_BAUD = 19200;
 constexpr uint32_t BUS_SEND_DELAY_MICROS = 13000;  // min. quiet time before transmitting
+
+
+#ifdef ESP32
+	// ESP-32 hardware serial
+	#define ge_serial Serial2
+
+	constexpr uint8_t BUS_DIR_PIN = 18;
+	constexpr uint8_t BUS_COMM_RX_PIN = 16;  // These are tied together
+	constexpr uint8_t BUS_COMM_TX_PIN = 17;  // These are tied together
+#elif ESP8266
+	#include <SoftwareSerial.h>
+
+	SoftwareSerial ge_serial;
+
+	constexpr uint8_t BUS_DIR_PIN = D1;
+	constexpr uint8_t BUS_COMM_RX_PIN = D2;  // D5
+	constexpr uint8_t BUS_COMM_TX_PIN = D2;  // D2; SoftwareSerial supports one-wire
+
+	#error "RX does not work yet, sorry :("
+#else
+	#error "Unsupported board!"
+#endif
+
 
 
 namespace CasseroleMessage {
@@ -81,13 +94,23 @@ void send_to_computer(uint8_t type) {
 }
 
 void set_transmit(bool tx) {
-	// inverted logic, so LOW=enabled, HIGH=disabled
+	// HIGH on DIR pin is A -> B
+	// LOW  on DIR pin is B -> A
+	// Switching time is no more than 30ns so a 1000ns delay should be plenty
 	if (tx) {
-		digitalWrite(BUS_RX_ENABLE_PIN, HIGH);
-		digitalWrite(BUS_TX_ENABLE_PIN, LOW);
+		digitalWrite(BUS_DIR_PIN, HIGH);
+		delayMicroseconds(1);
+
+		#ifdef ESP8266
+			ge_serial.enableTx(true);
+		#endif
 	} else {
-		digitalWrite(BUS_TX_ENABLE_PIN, HIGH);
-		digitalWrite(BUS_RX_ENABLE_PIN, LOW);
+		digitalWrite(BUS_DIR_PIN, LOW);
+		delayMicroseconds(1);
+
+		#ifdef ESP8266
+			ge_serial.enableTx(false);
+		#endif
 	}
 }
 
@@ -99,11 +122,27 @@ void setup() {
 	}
 
 	set_transmit(false);
-	pinMode(BUS_RX_ENABLE_PIN, OUTPUT);
-	pinMode(BUS_TX_ENABLE_PIN, OUTPUT);
+	pinMode(BUS_DIR_PIN, OUTPUT);
+
+	if (BUS_COMM_RX_PIN != BUS_COMM_TX_PIN) {
+		pinMode(BUS_COMM_RX_PIN, INPUT);
+		pinMode(BUS_COMM_TX_PIN, OUTPUT);
+	} else {
+		// One-wire mode
+		pinMode(BUS_COMM_RX_PIN, INPUT);
+		pinMode(BUS_COMM_TX_PIN, INPUT);
+	}
+
 	set_transmit(false);
 
-	ge_serial.begin(BUS_BAUD, SERIAL_8N1, BUS_RX_PIN, BUS_TX_PIN);
+	#ifdef ESP32
+		ge_serial.begin(BUS_BAUD, SERIAL_8N1, BUS_COMM_RX_PIN, BUS_COMM_TX_PIN, true, 0);
+	#elif ESP8266
+		ge_serial.begin(BUS_BAUD, SWSERIAL_8N1, BUS_COMM_RX_PIN, BUS_COMM_TX_PIN, true, 0, 0);
+		ge_serial.enableTx(false);  // start off in RX
+	#else
+		#error "Unsupported board!"
+	#endif
 
 	delay(500);
 	send_to_computer(CasseroleMessage::PING);

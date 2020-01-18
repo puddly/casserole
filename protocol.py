@@ -15,7 +15,7 @@ import coloredlogs
 from verboselogs import VerboseLogger
 
 logger = VerboseLogger(__name__)
-coloredlogs.install(level='DEBUG')
+coloredlogs.install(level='SPAM')
 
 
 def read_exactly(f, size):
@@ -575,26 +575,8 @@ class StackedWasherControls:
         KNOB_OPTIONS_PRE_SOAK_15_MIN = 0x1B
 
 
-
-
-
-async def main(adapter):
+async def attempt_washer_remote_start(protocol):
     loop = asyncio.get_event_loop()
-    transport, protocol = await serial_asyncio.create_serial_connection(loop, CasseroleProtocol, adapter, baudrate=115200)
-
-    while not protocol.transport:
-        logger.info('Waiting to connect...')
-        await asyncio.sleep(1)
-
-    await protocol.ping()
-
-    logger.info('Sending a broadcast to identify devices...')
-    response = await protocol.send_ge_message(GEBusMessage(source=0x1C, destination=0xFF, command=0x01, data=b''), retry=5, timeout=2)
-    address, version = response.source, response.data
-
-    logger.info('Found an appliance version %r at 0x%0.2X', version, address)
-
-
 
     # Capture a packet from the knobs board to steal its counter
     logger.info('Waiting for packet from knobs board...')
@@ -693,5 +675,33 @@ async def main(adapter):
 
     await asyncio.sleep(100000)
 
+
+
+
+async def main(adapter):
+    loop = asyncio.get_event_loop()
+    transport, protocol = await serial_asyncio.create_serial_connection(loop, CasseroleProtocol, adapter, baudrate=115200)
+
+    while not protocol.transport:
+        logger.info('Waiting to connect...')
+        await asyncio.sleep(1)
+
+    await protocol.ping()
+
+    logger.info('Sending a broadcast to identify devices...')
+    # Green Bean uses 0x1B as the source so I picked 0x1C
+    response = await protocol.send_ge_message(GEBusMessage(source=0x1C, destination=0xFF, command=0x01, data=b''), retry=5, timeout=2)
+    address, version = response.source, response.data
+
+    logger.info('Found an appliance version %r at 0x%0.2X', version, address)
+
+    while True:
+        await asyncio.sleep(100000)
+
+
 if __name__ == '__main__':
+    if len(sys.argv) != 1:
+        print(f'Usage: {__file__} <serial device>')
+        sys.exit(1)
+
     asyncio.run(main(sys.argv[1]))
