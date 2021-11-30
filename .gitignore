@@ -4,3 +4,10 @@ __pycache__
 .venv
 venv
 .pio
+
+board-backups
+board.kicad_prl
+fp-info-cache
+
+esp/
+build/
