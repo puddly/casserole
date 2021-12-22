@@ -1,5 +1,0 @@
-pyserial-asyncio==0.4
-async-timeout==3.0.1
-coloredlogs==10.0
-platformio==4.1.0
-verboselogs==1.7

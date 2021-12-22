@@ -11,3 +11,4 @@ fp-info-cache
 
 esp/
 build/
+*.egg-info
