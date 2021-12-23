@@ -15,5 +15,8 @@ def read_exactly(f, size: int) -> bytes:
     return result
 
 
-def pretty_bytes(data: bytes) -> str:
+def pretty_bytes(data: bytes | None) -> str:
+    if data is None:
+        return "None"
+
     return "<" + " ".join(f"{c:02X}" for c in data) + ">"

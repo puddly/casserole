@@ -4,55 +4,34 @@ import enum
 
 from verboselogs import VerboseLogger
 
-from casserole.utils import pretty_bytes, read_exactly
+from casserole.utils import pretty_bytes
 from casserole.exceptions import ParsingError, IncompleteReadError
 
 LOGGER = VerboseLogger(__name__)
 
 
-class GEBusCommand(enum.IntEnum):
-    READ = 0xF0
-    WRITE = 0xF1
-    SUBSCRIBE = 0xF2
-    SUBSCRIBE_LIST = 0xF3
-    UNSUBSCRIBE = 0xF4
-    PUBLISH = 0xF5
-
-    @classmethod
-    def _missing_(cls, value):
-        new = int.__new__(cls, value)
-        new._name_ = f"unknown_0x{value:02X}"
-        new._value_ = value
-
-        return new
-
-    def __repr__(self):
-        return f"<{self.__class__.__name__}.{self.name}: 0x{self.value:02X}>"
-
-
-class GEBusPacket:
+class GEAFrame:
     """
-    Encapsulated packet on the bus
+    Encapsulated frame on the bus
     """
 
-    ESCAPE_BYTE = 0xE0
-    END_OF_FRAME2 = 0xE1
+    ESCAPE = 0xE0
+    ACK = 0xE1
     START_OF_FRAME = 0xE2
     END_OF_FRAME = 0xE3
 
-    def __init__(self, *, src: int, dst: int, command: int, payload: bytes, eof2: bool):
-        self.src = src
+    def __init__(self, *, dst: int, src: int, payload: bytes, ack: bool):
         self.dst = dst
-        self.command = command
+        self.src = src
         self.payload = payload
-        self.eof2 = eof2
+        self.ack = ack
 
     @classmethod
-    def deserialize(cls, data: bytes) -> tuple[GEBusPacket, bytes]:
+    def deserialize(cls, data: bytes) -> tuple[GEAFrame, bytes]:
         orig_data = data
 
         if data[0] != cls.START_OF_FRAME:
-            raise ParsingError(f"Unexpected start of packet: 0x{data[0]:02X}", data[1:])
+            raise ParsingError(f"Unexpected start of frame: 0x{data[0]:02X}", data[1:])
 
         data = data[1:]
 
@@ -63,12 +42,10 @@ class GEBusPacket:
             raise ParsingError(f"Unexpected size: {size}", data)
 
         src, data = cls.read_unescaped(data)
-        command, data = cls.read_unescaped(data)
-        command = GEBusCommand(command)
 
         payload = bytearray()
 
-        for i in range(size - 8):
+        for i in range(size - 7):
             byte, data = cls.read_unescaped(data)
             payload.append(byte)
 
@@ -81,25 +58,25 @@ class GEBusPacket:
         if end_of_frame != cls.END_OF_FRAME:
             raise ParsingError(f"Unexpected end of frame: {end_of_frame:02X}", data)
 
-        end_of_frame2, data = cls.read_unescaped(data)
+        ACK, data = cls.read_unescaped(data)
 
-        if end_of_frame2 != cls.END_OF_FRAME2:
-            data = bytes([end_of_frame2]) + data
-            eof2 = False
+        if ACK != cls.ACK:
+            data = bytes([ACK]) + data
+            ack = False
         else:
-            eof2 = True
+            ack = True
 
-        message = cls(src=src, dst=dst, command=command, payload=payload, eof2=eof2)
+        message = cls(dst=dst, src=src, payload=payload, ack=ack)
         reconstructed = message.serialize()
 
         if reconstructed != orig_data[: len(reconstructed)]:
             raise ParsingError(
-                f"Reconstructed packet and original differ:"
+                f"Reconstructed frame and original differ:"
                 f" {reconstructed} != {orig_data[:len(reconstructed)]}",
                 data,
             )
 
-        if message.checksum != checksum:
+        if message.compute_checksum() != checksum:
             raise ParsingError(
                 f"Expected checksum {checksum:02X}, got {message.checksum:02X}", data
             )
@@ -111,14 +88,14 @@ class GEBusPacket:
         if not data:
             raise IncompleteReadError()
 
-        if data[0] != cls.ESCAPE_BYTE:
+        if data[0] != cls.ESCAPE:
             return data[0], data[1:]
 
         if len(data) < 2:
             raise IncompleteReadError()
         elif not 0xE0 <= data[1] <= 0xE3:
             raise ParsingError(
-                f"Invalid escape sequence: {cls.ESCAPE_BYTE:02X} {data[0]:02X}", data
+                f"Invalid escape sequence: {cls.ESCAPE:02X} {data[0]:02X}", data
             )
 
         return data[1], data[2:]
@@ -129,7 +106,7 @@ class GEBusPacket:
         unescaping = False
 
         for c in data:
-            if c == cls.ESCAPE_BYTE:
+            if c == cls.ESCAPE:
                 unescaping = True
                 continue
 
@@ -139,7 +116,7 @@ class GEBusPacket:
             result.append(c)
 
         if unescaping:
-            return result, bytes([cls.ESCAPE_BYTE]) + data
+            return result, bytes([cls.ESCAPE]) + data
 
         return result
 
@@ -149,7 +126,7 @@ class GEBusPacket:
 
         for c in data:
             if 0xE0 <= c <= 0xE3:
-                result.append(cls.ESCAPE_BYTE)
+                result.append(cls.ESCAPE)
 
             result.append(c)
 
@@ -179,8 +156,7 @@ class GEBusPacket:
 
         return crc
 
-    @property
-    def checksum(self) -> int:
+    def compute_checksum(self) -> int:
         return self.crc16(self.serialize(stop_at_checksum=True))
 
     def serialize(self, *, stop_at_checksum=False) -> bytes:
@@ -189,36 +165,31 @@ class GEBusPacket:
         else:
             payload = self.payload
 
+        size = 1 + 1 + 1 + 1 + len(payload) + 2 + 1
+
+        if self.ack:
+            size += 0
+
         header = bytes([self.START_OF_FRAME])
-        body = (
-            bytes(
-                [
-                    self.dst,
-                    (1 + 1 + 1 + 1 + 1 + len(payload) + 2 + 1),
-                    self.src,
-                    self.command,
-                ]
-            )
-            + payload
-        )
+        body = bytes([self.dst, size, self.src]) + payload
 
         if stop_at_checksum:
             return header + body
 
-        body += self.checksum.to_bytes(2, "big")
+        body += self.compute_checksum().to_bytes(2, "big")
 
         escaped_body = self.escape(body)
         escaped_body += bytes([self.END_OF_FRAME])
 
-        if self.eof2:
-            escaped_body += bytes([self.END_OF_FRAME2])
+        if self.ack:
+            escaped_body += bytes([self.ACK])
 
         return header + escaped_body
 
     def __repr__(self) -> str:
         output = [
             f"<{self.__class__.__name__}(src=0x{self.src:02X}, dst=0x{self.dst:02X},",
-            f" command={self.command!r}, data=",
+            " payload=",
         ]
 
         if isinstance(self.payload, (bytes, bytearray)):
@@ -226,83 +197,86 @@ class GEBusPacket:
         else:
             output.append(f"{self.payload}")
 
-        output.append(f", eof2={self.eof2}>")
+        output.append(f", ack={self.ack}>")
 
         return "".join(output)
 
 
-class GEBusMessageCommands:
-    def __init__(self, commands):
-        self.commands = commands
+class ERDCommandID(enum.IntEnum):
+    READ = 0xF0
+    WRITE = 0xF1
+    SUBSCRIBE = 0xF2
+    LIST_SUBSCRIBED = 0xF3
+    UNSUBSCRIBE = 0xF4
+    PUBLISH = 0xF5
 
     @classmethod
-    def from_file(cls, f):
-        count = int.from_bytes(read_exactly(f, 1), "big")
-        commands = []
+    def _missing_(cls, value):
+        new = int.__new__(cls, value)
+        new._name_ = f"unknown_0x{value:02X}"
+        new._value_ = value
 
-        next_byte = None
+        return new
+
+    def __repr__(self):
+        return f"<{self.__class__.__name__}.{self.name}: 0x{self.value:02X}>"
+
+
+class ERDCommand:
+    def __init__(self, command: ERDCommandID, erds: list[tuple[int, bytes]]):
+        self.command = command
+        self.erds = erds
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> tuple[ERDCommand, bytes]:
+        if len(data) < 2:
+            raise ParsingError("Data is too short", data)
+
+        command = ERDCommandID(data[0])
+        count = data[1]
+        data = data[2:]
+
+        erds = []
 
         for i in range(count):
-            if next_byte is not None:
-                subcommand_byte = next_byte
-                next_byte = None
-            else:
-                subcommand_byte = read_exactly(f, 1)
+            erd_msb = data[0]
+            erd_lsb = data[1]
+            erd = (erd_msb << 8) | (erd_lsb << 0)
 
-            subcommand = cls.Commands(int.from_bytes(subcommand_byte, "big"))
-            endpoint_id = int.from_bytes(read_exactly(f, 1), "big")
-
-            # It's OK not to read anything here
-            next_byte = f.read(1)
-
-            if not next_byte or any(
-                next_byte[0] == m.value for m in cls.Commands.__members__.values()
-            ):
-                commands.append((subcommand, endpoint_id, None))
+            if len(data) == 2:
+                erds.append((erd, None))
+                data = data[2:]
                 continue
 
-            size = int.from_bytes(next_byte, "big")
-            next_byte = None
+            size = data[2]
+            payload = bytes(data[3 : 3 + size])
+            data = data[3 + size :]
 
-            data = read_exactly(f, size)
+            erds.append((erd, payload))
 
-            commands.append((subcommand, endpoint_id, data))
+        return cls(command=command, erds=erds), data
 
-        return cls(commands)
+    def serialize(self) -> bytes:
+        result = bytes([self.command, len(self.erds)])
 
-    def to_bytes(self):
-        result = b""
-        result += len(self.commands).to_bytes(1, "big")
-
-        for command, endpoint_id, data in self.commands:
-            result += command.value.to_bytes(1, "big")
-            result += endpoint_id.to_bytes(1, "big")
-
-            if data is not None:
-                result += len(data).to_bytes(1, "big")
-                result += data
+        for erd, payload in self.erds:
+            if payload is not None:
+                result += erd.to_bytes(2, "big") + bytes([len(payload)]) + payload
+            else:
+                result += erd.to_bytes(2, "big")
 
         return result
 
-    def __repr__(self):
-        lines = [f"<{self.__class__.__name__}(commands=["]
+    def __repr__(self) -> str:
+        erds = ", ".join(
+            [f"0x{erd:04X}:{pretty_bytes(payload)}" for erd, payload in self.erds]
+        )
+        return f"<{self.__class__.__name__}(command={self.command!r}, erds=[{erds}])>"
 
-        for command, endpoint_id, data in self.commands:
-            if (data is not None and command == self.Commands.READ) or (
-                data is None and command != self.Commands.READ
-            ):
-                command_name = f"{command.name}_RESP"
-            else:
-                command_name = command.name
 
-            if data is not None:
-                lines.append(
-                    f"    {command_name:>14}(endpoint=0x{endpoint_id:02X},"
-                    f" data=[{pretty_bytes(data)}])"
-                )
-            else:
-                lines.append(f"    {command_name:>14}(endpoint=0x{endpoint_id:02X})")
+if __name__ == "__main__":
+    payload = bytes.fromhex("F0 01 20 12")
+    grp, rest = ERDCommand.deserialize(payload)
 
-        lines.append("]>")
-
-        return "\n".join(lines)
+    print(grp)
+    print(rest)

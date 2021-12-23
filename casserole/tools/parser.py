@@ -4,7 +4,7 @@ import coloredlogs
 from verboselogs import VerboseLogger
 
 from casserole.utils import pretty_bytes
-from casserole.protocol import GEBusPacket
+from casserole.protocol import GEAFrame, ERDCommand, ERDCommandID
 from casserole.exceptions import ParsingError, IncompleteReadError
 
 LOGGER = VerboseLogger(__name__)
@@ -12,7 +12,7 @@ LOGGER = VerboseLogger(__name__)
 
 def parse_data(data: bytes):
     while data:
-        skipped = data.index(GEBusPacket.START_OF_FRAME)
+        skipped = data.index(GEAFrame.START_OF_FRAME)
 
         if skipped > 0:
             LOGGER.warning(
@@ -23,7 +23,7 @@ def parse_data(data: bytes):
         # LOGGER.info("Trying to parse              %s", pretty_bytes(data))
 
         try:
-            packet, new_data = GEBusPacket.deserialize(data)
+            packet, new_data = GEAFrame.deserialize(data)
         except IncompleteReadError:
             break
         except ParsingError:
@@ -36,6 +36,22 @@ def parse_data(data: bytes):
 
         LOGGER.debug("RX: %s", pretty_bytes(parsed_chunk))
         LOGGER.info("Parsed: %s", packet)
+
+        if ERDCommandID.READ <= packet.payload[0] <= ERDCommandID.PUBLISH:
+            try:
+                command, remaining = ERDCommand.deserialize(packet.payload)
+            except Exception:
+                LOGGER.warning(
+                    "Failed to parse ERD: %s",
+                    pretty_bytes(packet.payload),
+                    exc_info=True,
+                )
+                continue
+
+            LOGGER.info("Parsed payload: %s", command)
+            assert command.serialize() == packet.payload
+        else:
+            LOGGER.error("Unknown command: %02X", packet.payload[0])
 
     if data:
         LOGGER.warning("Did not parse trailing data: %s", pretty_bytes(data))
